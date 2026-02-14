@@ -3,44 +3,37 @@
 UniFi Protect Animal Alarm → Trimlight Red Alert
 
 Receives webhook POSTs from UniFi Protect's Alarm Manager when an animal is
-detected and turns the Trimlight Edge lights solid red. After a configurable
-timeout the lights auto-restore to their previous state.
+detected and turns the Trimlight Edge lights solid red via the Trimlight
+cloud API.  After a configurable timeout the lights auto-restore to their
+previous state.
 
 Requires only Python stdlib — no pip dependencies.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import signal
-import socket
-import struct
 import sys
 import threading
 import time
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# ---------------------------------------------------------------------------
-# Constants – Trimlight binary protocol
-# ---------------------------------------------------------------------------
-START_FLAG = 0x5A
-END_FLAG = 0xA5
-
-CMD_SYNC_DETAIL = 0x02
-CMD_CHECK_PATTERN = 0x03
-CMD_CHECK_DEVICE = 0x0C
-CMD_SET_MODE = 0x0D
-CMD_PREVIEW_PATTERN = 0x13
-CMD_SET_SOLID_COLOR = 0x14
-
-MODE_TIMER = 0x00
-MODE_MANUAL = 0x01
-
-# Solid-red colour
-RED = (0xFF, 0x00, 0x00)
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 log = logging.getLogger("alarm")
+
+# Solid red as decimal integer: 0xFF0000 = 16711680
+COLOR_RED = 16711680
+
+# Switch states
+SWITCH_OFF = 0
+SWITCH_MANUAL = 1
+SWITCH_TIMER = 2
 
 # ---------------------------------------------------------------------------
 # Config
@@ -49,192 +42,192 @@ class Config:
     """Read and validate configuration from environment variables."""
 
     def __init__(self):
-        self.trimlight_host = os.environ.get("TRIMLIGHT_HOST", "")
-        self.trimlight_port = int(os.environ.get("TRIMLIGHT_PORT", "8189"))
+        self.client_id = os.environ.get("TRIMLIGHT_CLIENT_ID", "")
+        self.client_secret = os.environ.get("TRIMLIGHT_CLIENT_SECRET", "")
+        self.device_id = os.environ.get("TRIMLIGHT_DEVICE_ID", "")
+        self.api_url = os.environ.get(
+            "TRIMLIGHT_API_URL", "https://trimlight.ledhue.com/trimlight"
+        )
         self.webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
         self.alarm_timeout = int(os.environ.get("ALARM_TIMEOUT", "30"))
         self.trigger_key = os.environ.get("TRIGGER_KEY", "animal")
         self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     def validate(self):
-        if not self.trimlight_host:
-            sys.exit("ERROR: TRIMLIGHT_HOST environment variable is required")
+        missing = []
+        if not self.client_id:
+            missing.append("TRIMLIGHT_CLIENT_ID")
+        if not self.client_secret:
+            missing.append("TRIMLIGHT_CLIENT_SECRET")
+        if not self.device_id:
+            missing.append("TRIMLIGHT_DEVICE_ID")
+        if missing:
+            sys.exit("ERROR: Required environment variables not set: " + ", ".join(missing))
         if self.alarm_timeout < 1:
             sys.exit("ERROR: ALARM_TIMEOUT must be >= 1")
 
+
 # ---------------------------------------------------------------------------
-# Trimlight TCP client
+# Trimlight Cloud API client
 # ---------------------------------------------------------------------------
 class TrimlightClient:
-    """Communicate with a Trimlight Edge controller over its binary TCP
-    protocol on port 8189."""
+    """Communicate with a Trimlight Edge controller via the cloud REST API.
 
-    RECV_TIMEOUT = 5  # seconds
+    API docs: https://trimlight.com/hubfs/Manuals/Trimlight_Edge_API_Documentation%208192022.pdf
+    Base URL: POST https://trimlight.ledhue.com/trimlight/<path>
+    Auth:     HMAC-SHA256(clientSecret, "Trimlight|<clientId>|<timestamp>")
+    """
 
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self._sock = None
+    REQUEST_TIMEOUT = 15  # seconds
 
-    # -- connection lifecycle -----------------------------------------------
+    def __init__(self, config: Config):
+        self.config = config
 
-    def connect(self):
-        """Open a TCP connection to the controller."""
-        log.info("Connecting to %s:%d", self.host, self.port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(self.RECV_TIMEOUT)
-        self._sock.connect((self.host, self.port))
-        log.info("Connected")
+    # -- auth ---------------------------------------------------------------
 
-    def close(self):
-        """Close the TCP connection."""
-        if self._sock:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
-            log.debug("Connection closed")
+    def _auth_headers(self) -> dict:
+        """Build the required authentication headers."""
+        timestamp = str(int(time.time() * 1000))
+        message = f"Trimlight|{self.config.client_id}|{timestamp}"
+        mac = hmac.new(
+            self.config.client_secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        token = base64.b64encode(mac).decode("utf-8")
+        return {
+            "authorization": token,
+            "S-ClientId": self.config.client_id,
+            "S-Timestamp": timestamp,
+            "Content-Type": "application/json",
+        }
 
-    # -- low-level framing --------------------------------------------------
+    # -- low-level request --------------------------------------------------
 
-    @staticmethod
-    def _build_frame(command: int, payload: bytes) -> bytes:
-        """Build a framed message: [0x5A] [cmd] [len BE16] [payload] [0xA5]"""
-        length = len(payload)
-        frame = bytes([START_FLAG, command]) + struct.pack(">H", length) + payload + bytes([END_FLAG])
-        return frame
+    def _post(self, path: str, body: dict) -> dict:
+        """Send a POST request to the Trimlight cloud API."""
+        url = self.config.api_url + path
+        data = json.dumps(body).encode("utf-8")
+        headers = self._auth_headers()
 
-    def _send(self, command: int, payload: bytes):
-        """Send a framed command to the controller."""
-        frame = self._build_frame(command, payload)
-        log.debug("TX cmd=0x%02X len=%d  %s", command, len(payload), frame.hex())
-        self._sock.sendall(frame)
-
-    def _recv(self) -> tuple:
-        """Receive one framed response.  Returns (command, payload)."""
-        # Read start flag + command + 2-byte length
-        header = self._recv_exact(4)
-        if header[0] != START_FLAG:
-            raise ProtocolError(f"Bad start flag: 0x{header[0]:02X}")
-        cmd = header[1]
-        length = struct.unpack(">H", header[2:4])[0]
-        payload = self._recv_exact(length) if length else b""
-        end = self._recv_exact(1)
-        if end[0] != END_FLAG:
-            raise ProtocolError(f"Bad end flag: 0x{end[0]:02X}")
-        log.debug("RX cmd=0x%02X len=%d  %s", cmd, length, payload.hex())
-        return cmd, payload
-
-    def _recv_exact(self, n: int) -> bytes:
-        """Read exactly *n* bytes from the socket."""
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self._sock.recv(n - len(buf))
-            if not chunk:
-                raise ConnectionError("Socket closed while reading")
-            buf.extend(chunk)
-        return bytes(buf)
+        log.debug("API POST %s  body=%s", path, json.dumps(body))
+        req = Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urlopen(req, timeout=self.REQUEST_TIMEOUT) as resp:
+                raw = resp.read()
+                result = json.loads(raw)
+                log.debug("API response: %s", json.dumps(result))
+                if result.get("code") != 0:
+                    raise APIError(
+                        f"API error: code={result.get('code')} desc={result.get('desc')}"
+                    )
+                return result
+        except HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise APIError(f"HTTP {exc.code}: {body_text}") from exc
+        except URLError as exc:
+            raise APIError(f"Request failed: {exc.reason}") from exc
 
     # -- high-level commands ------------------------------------------------
 
-    def handshake(self):
-        """Send CMD_CHECK_DEVICE (0x0C) with verification bytes + datetime."""
+    def get_device_detail(self) -> dict:
+        """Get device detail data (API #4)."""
         now = datetime.now()
-        payload = bytes([
-            0x56, 0x56,  # verification bytes
-            now.year - 2000,
-            now.month,
-            now.day,
-            now.hour,
-            now.minute,
-            now.second,
-        ])
-        self._send(CMD_CHECK_DEVICE, payload)
-        cmd, resp = self._recv()
-        log.info("Handshake response: cmd=0x%02X payload=%s", cmd, resp.hex())
+        weekday = now.isoweekday()  # Mon=1..Sun=7
+        # API uses: SUNDAY=1, MONDAY=2, ..., SATURDAY=7
+        api_weekday = 1 if weekday == 7 else weekday + 1
 
-    def sync_detail(self) -> dict:
-        """Query the current state (mode, pattern ID, etc.)."""
-        self._send(CMD_SYNC_DETAIL, b"")
-        cmd, payload = self._recv()
-        if len(payload) < 3:
-            log.warning("sync_detail: short payload (%d bytes)", len(payload))
-            return {"raw": payload, "mode": None, "pattern_id": None}
-        mode = payload[0]
-        pattern_id = payload[1]
+        result = self._post("/v1/oauth/resources/device/get", {
+            "deviceId": self.config.device_id,
+            "currentDate": {
+                "year": now.year - 2000,
+                "month": now.month,
+                "day": now.day,
+                "weekday": api_weekday,
+                "hours": now.hour,
+                "minutes": now.minute,
+                "seconds": now.second,
+            },
+        })
+        payload = result.get("payload", {})
         log.info(
-            "sync_detail: mode=%d (%s)  pattern_id=%d",
-            mode,
-            "Timer" if mode == MODE_TIMER else "Manual",
-            pattern_id,
+            "Device detail: switchState=%s connectivity=%s",
+            payload.get("switchState"),
+            payload.get("connectivity"),
         )
-        return {"raw": payload, "mode": mode, "pattern_id": pattern_id}
+        return payload
 
-    def set_mode(self, mode: int):
-        """Switch between Timer (0) and Manual (1) mode."""
-        label = "Timer" if mode == MODE_TIMER else "Manual"
-        log.info("Setting mode → %s (%d)", label, mode)
-        self._send(CMD_SET_MODE, bytes([mode]))
-        cmd, resp = self._recv()
-        log.debug("set_mode response: %s", resp.hex())
+    def set_switch_state(self, state: int):
+        """Set device switch state (API #5).
 
-    def set_solid_color(self, r: int, g: int, b: int):
-        """Set all pixels to a single colour (0x14)."""
-        log.info("Setting solid colour → #%02X%02X%02X", r, g, b)
-        self._send(CMD_SET_SOLID_COLOR, bytes([r, g, b]))
-        try:
-            cmd, resp = self._recv()
-            log.debug("set_solid_color response: %s", resp.hex())
-        except socket.timeout:
-            log.debug("No response to set_solid_color (may be normal)")
-
-    def preview_pattern_solid(self, r: int, g: int, b: int):
-        """Fallback: send a solid colour via CMD_PREVIEW_PATTERN (0x13).
-
-        The 31-byte payload encodes a single-colour static pattern compatible
-        with Trimlight Edge controllers that may not support 0x14.
+        0 = light off, 1 = manual mode, 2 = timer mode.
         """
-        log.info("Preview-pattern fallback → solid #%02X%02X%02X", r, g, b)
-        # Pattern layout: 7 colour slots (3 bytes each = 21) + 10 config bytes
-        colours = bytes([r, g, b]) + bytes(18)  # one colour + 6 unused slots
-        config = bytes([
-            0x01,  # number of colours used
-            0x00,  # animation mode (0 = static)
-            0x00, 0x00,  # speed (unused for static)
-            0x00, 0x00,  # brightness (controller default)
-            0x00, 0x00, 0x00, 0x00,  # reserved
-        ])
-        payload = colours + config
-        assert len(payload) == 31, f"Expected 31-byte payload, got {len(payload)}"
-        self._send(CMD_PREVIEW_PATTERN, payload)
-        try:
-            cmd, resp = self._recv()
-            log.debug("preview_pattern response: %s", resp.hex())
-        except socket.timeout:
-            log.debug("No response to preview_pattern (may be normal)")
+        labels = {0: "Off", 1: "Manual", 2: "Timer"}
+        log.info("Setting switch state → %s (%d)", labels.get(state, "?"), state)
+        self._post("/v1/oauth/resources/device/update", {
+            "deviceId": self.config.device_id,
+            "payload": {"switchState": state},
+        })
 
-    def check_pattern(self, pattern_id: int):
-        """Restore a saved pattern by its ID (0x03)."""
-        log.info("Restoring pattern ID %d", pattern_id)
-        self._send(CMD_CHECK_PATTERN, bytes([pattern_id]))
-        try:
-            cmd, resp = self._recv()
-            log.debug("check_pattern response: %s", resp.hex())
-        except socket.timeout:
-            log.debug("No response to check_pattern (may be normal)")
+    def preview_custom_effect(self, pixels: list, mode: int = 0,
+                              speed: int = 100, brightness: int = 255):
+        """Preview a custom effect on the device (API #11).
+
+        mode 0 = STATIC, see docs for other modes.
+        """
+        log.info("Previewing custom effect: mode=%d pixels=%d", mode, len(pixels))
+        self._post("/v1/oauth/resources/device/effect/preview", {
+            "deviceId": self.config.device_id,
+            "payload": {
+                "category": 1,
+                "mode": mode,
+                "speed": speed,
+                "brightness": brightness,
+                "pixels": pixels,
+            },
+        })
+
+    def view_effect(self, effect_id: int):
+        """Check out / activate a saved effect by ID (API #13)."""
+        log.info("Activating saved effect ID %d", effect_id)
+        self._post("/v1/oauth/resources/device/effect/view", {
+            "deviceId": self.config.device_id,
+            "payload": {"id": effect_id},
+        })
+
+    def notify_update_shadow(self):
+        """Notify device to report latest shadow data (API #25)."""
+        now = datetime.now()
+        weekday = now.isoweekday()
+        api_weekday = 1 if weekday == 7 else weekday + 1
+
+        log.debug("Notifying device to update shadow data")
+        self._post("/v1/oauth/resources/device/notify-update-shadow", {
+            "deviceId": self.config.device_id,
+            "currentDate": {
+                "year": now.year - 2000,
+                "month": now.month,
+                "day": now.day,
+                "weekday": api_weekday,
+                "hours": now.hour,
+                "minutes": now.minute,
+                "seconds": now.second,
+            },
+        })
 
     def activate_red(self):
-        """Set the lights solid red. Tries 0x14 first, falls back to 0x13."""
-        try:
-            self.set_solid_color(*RED)
-        except Exception as exc:
-            log.warning("set_solid_color failed (%s), trying preview fallback", exc)
-            self.preview_pattern_solid(*RED)
+        """Set all lights to solid red."""
+        self.set_switch_state(SWITCH_MANUAL)
+        self.preview_custom_effect(
+            pixels=[{"index": 0, "count": 60, "color": COLOR_RED, "disable": False}],
+            mode=0,       # STATIC
+            speed=100,
+            brightness=255,
+        )
 
 
-class ProtocolError(Exception):
-    """Unexpected data in the Trimlight protocol stream."""
+class APIError(Exception):
+    """Error communicating with the Trimlight cloud API."""
 
 
 # ---------------------------------------------------------------------------
@@ -257,8 +250,8 @@ class AlarmStateMachine:
         self._state = self.IDLE
         self._lock = threading.Lock()
         self._timer = None
-        self._saved_mode = None
-        self._saved_pattern_id = None
+        self._saved_switch_state = None
+        self._saved_effect_id = None
 
     @property
     def state(self) -> str:
@@ -275,15 +268,13 @@ class AlarmStateMachine:
                 return
             if self._state == self.RESTORING:
                 log.info("Restore in progress — will re-alarm after")
-                # Let the restore finish, then we'll re-trigger from idle.
-                # Queue a delayed re-trigger.
                 threading.Thread(target=self._wait_and_retrigger, daemon=True).start()
                 return
             # IDLE → ALARMED
             self._state = self.ALARMED
             log.info("State → ALARMED")
 
-        # Outside the lock: talk to the controller (blocking I/O)
+        # Outside the lock: talk to the cloud API (blocking I/O)
         try:
             self._activate_alarm()
         except Exception:
@@ -298,21 +289,29 @@ class AlarmStateMachine:
     # -- internals ----------------------------------------------------------
 
     def _activate_alarm(self):
-        """Connect, handshake, save state, switch to manual, set red."""
-        client = TrimlightClient(self.config.trimlight_host, self.config.trimlight_port)
+        """Query current state, switch to manual, set solid red."""
+        client = TrimlightClient(self.config)
+        # Request fresh data from the device
         try:
-            client.connect()
-            client.handshake()
-            detail = client.sync_detail()
-            self._saved_mode = detail.get("mode")
-            self._saved_pattern_id = detail.get("pattern_id")
-            client.set_mode(MODE_MANUAL)
-            client.activate_red()
-        finally:
-            client.close()
+            client.notify_update_shadow()
+            time.sleep(1)  # give the device a moment to report
+        except Exception:
+            log.debug("notify_update_shadow failed (non-fatal), continuing")
+
+        detail = client.get_device_detail()
+        self._saved_switch_state = detail.get("switchState")
+        current_effect = detail.get("currentEffect") or {}
+        effect_id = current_effect.get("id") if isinstance(current_effect, dict) else None
+        self._saved_effect_id = effect_id if effect_id is not None and effect_id >= 0 else None
+        log.info(
+            "Saved state: switchState=%s effectId=%s",
+            self._saved_switch_state,
+            self._saved_effect_id,
+        )
+        client.activate_red()
 
     def _restore(self):
-        """Reconnect and restore the previous state."""
+        """Restore the previous state."""
         with self._lock:
             if self._state != self.ALARMED:
                 return
@@ -320,19 +319,27 @@ class AlarmStateMachine:
             log.info("State → RESTORING")
 
         try:
-            client = TrimlightClient(self.config.trimlight_host, self.config.trimlight_port)
-            try:
-                client.connect()
-                client.handshake()
-                if self._saved_mode == MODE_MANUAL and self._saved_pattern_id is not None:
-                    log.info("Previous mode was Manual — restoring pattern %d", self._saved_pattern_id)
-                    client.set_mode(MODE_MANUAL)
-                    client.check_pattern(self._saved_pattern_id)
+            client = TrimlightClient(self.config)
+            if self._saved_switch_state == SWITCH_TIMER:
+                log.info("Restoring Timer mode (controller resumes schedule)")
+                client.set_switch_state(SWITCH_TIMER)
+            elif self._saved_switch_state == SWITCH_MANUAL:
+                log.info("Previous mode was Manual")
+                if self._saved_effect_id is not None:
+                    log.info("Restoring saved effect ID %d", self._saved_effect_id)
+                    client.view_effect(self._saved_effect_id)
                 else:
-                    log.info("Restoring Timer mode (controller resumes schedule)")
-                    client.set_mode(MODE_TIMER)
-            finally:
-                client.close()
+                    log.info("No saved effect ID — switching to Timer mode")
+                    client.set_switch_state(SWITCH_TIMER)
+            elif self._saved_switch_state == SWITCH_OFF:
+                log.info("Previous mode was Off — turning lights off")
+                client.set_switch_state(SWITCH_OFF)
+            else:
+                log.warning(
+                    "Unknown saved switchState=%s — defaulting to Timer",
+                    self._saved_switch_state,
+                )
+                client.set_switch_state(SWITCH_TIMER)
         except Exception:
             log.exception("Failed to restore — lights may remain red")
 
@@ -445,11 +452,8 @@ def main():
     )
 
     log.info("Starting UniFi Protect → Trimlight alarm service")
-    log.info(
-        "  Trimlight host : %s:%d",
-        config.trimlight_host,
-        config.trimlight_port,
-    )
+    log.info("  API URL        : %s", config.api_url)
+    log.info("  Device ID      : %s", config.device_id)
     log.info("  Webhook port   : %d", config.webhook_port)
     log.info("  Alarm timeout  : %ds", config.alarm_timeout)
     log.info("  Trigger key    : %s", config.trigger_key)
