@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-UniFi Protect Animal Alarm → Trimlight Red Alert
+UniFi Protect → Trimlight Alarm Service
 
-Receives webhook POSTs from UniFi Protect's Alarm Manager when an animal is
-detected and turns the Trimlight Edge lights solid red via the Trimlight
-cloud API.  After a configurable timeout the lights auto-restore to their
-previous state.
+Receives webhook POSTs from UniFi Protect's Alarm Manager and applies a
+named light effect via the Trimlight Edge cloud API.  After a configurable
+timeout the lights auto-restore to their previous state.
+
+The effect to apply is specified in the webhook URL:
+    POST /webhook?effect=white       → solid white  (e.g. animal / person)
+    POST /webhook?effect=red-strobe  → red strobe   (e.g. vehicle)
+    POST /webhook                    → uses default effect (white)
 
 Requires only Python stdlib — no pip dependencies.
 """
@@ -22,13 +26,25 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
 log = logging.getLogger("alarm")
 
-# Solid red as decimal integer: 0xFF0000 = 16711680
-COLOR_RED = 16711680
+# ---------------------------------------------------------------------------
+# Named light effects
+# Each entry: label, color (RGB int), mode (Trimlight custom mode), speed, brightness
+# Custom effect modes: 0=Static 1=Chase Fwd 2=Chase Bwd 5=Stars 6=Breath 15=Strobe 16=Fade
+# ---------------------------------------------------------------------------
+EFFECTS = {
+    "white":      {"label": "Solid White",  "color": 0xFFFFFF, "mode": 0,  "speed": 100, "brightness": 255},
+    "red":        {"label": "Solid Red",    "color": 0xFF0000, "mode": 0,  "speed": 100, "brightness": 255},
+    "red-strobe": {"label": "Red Strobe",   "color": 0xFF0000, "mode": 15, "speed": 150, "brightness": 180},
+    "blue":       {"label": "Solid Blue",   "color": 0x0000FF, "mode": 0,  "speed": 100, "brightness": 255},
+    "amber":      {"label": "Solid Amber",  "color": 0xFF8C00, "mode": 0,  "speed": 100, "brightness": 255},
+}
+DEFAULT_EFFECT = "white"
 
 # Switch states
 SWITCH_OFF    = 0
@@ -49,7 +65,6 @@ class Config:
         )
         self.webhook_port  = int(os.environ.get("WEBHOOK_PORT", "8484"))
         self.alarm_timeout = int(os.environ.get("ALARM_TIMEOUT", "30"))
-        self.trigger_key   = os.environ.get("TRIGGER_KEY", "animal")
         self.log_level     = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     def validate(self):
@@ -88,7 +103,7 @@ class TrimlightClient:
     def _auth_headers(self) -> dict:
         timestamp = str(int(time.time() * 1000))
         message   = f"Trimlight|{self.config.client_id}|{timestamp}"
-        mac       = hmac.new(
+        mac = hmac.new(
             self.config.client_secret.encode(),
             message.encode(),
             hashlib.sha256,
@@ -121,22 +136,19 @@ class TrimlightClient:
 
     def _now_date(self) -> dict:
         now     = datetime.now()
-        weekday = now.isoweekday()              # Mon=1 … Sun=7
+        weekday = now.isoweekday()   # Mon=1 … Sun=7
         return {
             "year":    now.year - 2000,
             "month":   now.month,
             "day":     now.day,
-            "weekday": 1 if weekday == 7 else weekday + 1,   # Sun=1 … Sat=7
+            "weekday": 1 if weekday == 7 else weekday + 1,  # Sun=1 … Sat=7
             "hours":   now.hour,
             "minutes": now.minute,
             "seconds": now.second,
         }
 
-    # -- high-level commands ------------------------------------------------
-
     def notify_update_shadow(self):
         """Ask the device to push its latest state to the cloud (API #25)."""
-        log.debug("notify_update_shadow")
         self._post("/v1/oauth/resources/device/notify-update-shadow", {
             "deviceId":    self.config.device_id,
             "currentDate": self._now_date(),
@@ -149,10 +161,8 @@ class TrimlightClient:
             "currentDate": self._now_date(),
         })
         payload = result.get("payload", {})
-        log.info(
-            "Device detail: switchState=%s connectivity=%s",
-            payload.get("switchState"), payload.get("connectivity"),
-        )
+        log.info("Device detail: switchState=%s connectivity=%s",
+                 payload.get("switchState"), payload.get("connectivity"))
         return payload
 
     def set_switch_state(self, state: int):
@@ -164,18 +174,21 @@ class TrimlightClient:
             "payload":  {"switchState": state},
         })
 
-    def preview_solid_red(self):
-        """Preview a solid-red static custom effect (API #11)."""
-        log.info("preview_solid_red")
+    def preview_effect(self, effect: dict):
+        """Preview a named effect on the device (API #11).
+
+        Note: Edge firmware uses category=2 for custom effects (docs say 1).
+        """
+        log.info("preview_effect: %s", effect.get("label", effect))
         self._post("/v1/oauth/resources/device/effect/preview", {
             "deviceId": self.config.device_id,
             "payload": {
-                "category":   2,        # Edge uses category 2 (docs say 1, device expects 2)
-                "mode":       0,        # STATIC
-                "speed":      100,
-                "brightness": 255,
+                "category":   2,
+                "mode":       effect["mode"],
+                "speed":      effect["speed"],
+                "brightness": effect["brightness"],
                 "pixels": [
-                    {"index": 0, "count": 1, "color": COLOR_RED, "disable": False},
+                    {"index": 0, "count": 1, "color": effect["color"], "disable": False},
                 ],
             },
         })
@@ -194,32 +207,34 @@ class TrimlightClient:
 # ---------------------------------------------------------------------------
 class AlarmStateMachine:
     """
-    IDLE ──trigger──▸ ALARMED ──timeout──▸ RESTORING ──done──▸ IDLE
-
-    Debounce: re-triggering while ALARMED resets the timeout timer.
+    IDLE ──trigger(effect)──▸ ALARMED ──timeout──▸ RESTORING ──done──▸ IDLE
+                                ▲                                        │
+                          trigger (same effect): reset timer             │
+                          trigger (new effect):  apply new + reset       │
+                          ◀──────────────────────────────────────────────┘
     """
 
-    IDLE       = "idle"
-    ALARMED    = "alarmed"
-    RESTORING  = "restoring"
-    MAX_LOG    = 30
+    IDLE      = "idle"
+    ALARMED   = "alarmed"
+    RESTORING = "restoring"
+    MAX_LOG   = 30
 
     def __init__(self, config: Config):
         self.config              = config
         self._state              = self.IDLE
         self._lock               = threading.Lock()
         self._timer              = None
+        self._current_effect     = None   # effect name active during alarm
         self._saved_switch_state = None
         self._saved_effect_id    = None
-        self.last_triggered      = None   # ISO string
-        self.last_restored       = None   # ISO string
-        self.activity_log        = []     # [(ts_str, level, message), …]
+        self.last_triggered      = None
+        self.last_effect         = None
+        self.last_restored       = None
+        self.activity_log        = []
 
     @property
     def state(self) -> str:
         return self._state
-
-    # -- activity log -------------------------------------------------------
 
     def _log(self, message: str, level: str = "info"):
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -231,24 +246,50 @@ class AlarmStateMachine:
 
     # -- public interface ---------------------------------------------------
 
-    def trigger(self):
-        """Called when the webhook fires.  Thread-safe."""
+    def trigger(self, effect_name: str = DEFAULT_EFFECT):
+        """Fire the alarm with the given named effect. Thread-safe."""
+        effect_name = effect_name if effect_name in EFFECTS else DEFAULT_EFFECT
+        effect      = EFFECTS[effect_name]
+
         with self._lock:
             if self._state == self.ALARMED:
-                self._log("Already alarmed — resetting timer (debounce)")
-                self._reset_timer()
+                if effect_name == self._current_effect:
+                    self._log(f"Already alarmed ({effect['label']}) — resetting timer")
+                    self._reset_timer()
+                    return
+                # Different effect — override immediately
+                self._log(
+                    f"Override: {EFFECTS[self._current_effect]['label']} "
+                    f"→ {effect['label']}"
+                )
+                self._current_effect = effect_name
+                self.last_effect     = effect_name
+                if self._timer:
+                    self._timer.cancel()
+                    self._timer = None
+                threading.Thread(
+                    target=self._apply_effect_and_reset_timer,
+                    args=(effect_name,), daemon=True,
+                ).start()
                 return
+
             if self._state == self.RESTORING:
-                self._log("Restore in progress — queuing re-alarm")
-                threading.Thread(target=self._wait_and_retrigger, daemon=True).start()
+                self._log(f"Restore in progress — queuing re-alarm ({effect['label']})")
+                threading.Thread(
+                    target=self._wait_and_retrigger,
+                    args=(effect_name,), daemon=True,
+                ).start()
                 return
-            self._state = self.ALARMED
-            self.last_triggered = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        self._log("Animal detected — activating alarm")
+            # IDLE → ALARMED
+            self._state          = self.ALARMED
+            self._current_effect = effect_name
+            self.last_triggered  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.last_effect     = effect_name
 
+        self._log(f"Alarm triggered — {effect['label']}")
         try:
-            self._activate_alarm()
+            self._activate_alarm(effect_name)
         except Exception as exc:
             self._log(f"Failed to activate alarm: {exc}", level="error")
             log.exception("Alarm activation error")
@@ -256,13 +297,14 @@ class AlarmStateMachine:
                 self._state = self.IDLE
             return
 
-        self._log(f"Lights set to solid red — restoring in {self.config.alarm_timeout}s")
+        self._log(f"{effect['label']} active — restoring in {self.config.alarm_timeout}s")
         with self._lock:
             self._reset_timer()
 
     # -- internals ----------------------------------------------------------
 
-    def _activate_alarm(self):
+    def _activate_alarm(self, effect_name: str):
+        """Save device state, switch to Manual, apply effect."""
         client = TrimlightClient(self.config)
         try:
             client.notify_update_shadow()
@@ -272,16 +314,28 @@ class AlarmStateMachine:
 
         detail = client.get_device_detail()
         self._saved_switch_state = detail.get("switchState")
-        effect = detail.get("currentEffect") or {}
-        eid    = effect.get("id") if isinstance(effect, dict) else None
+        current = detail.get("currentEffect") or {}
+        eid = current.get("id") if isinstance(current, dict) else None
         self._saved_effect_id = eid if eid is not None and eid >= 0 else None
         log.info("Saved state: switchState=%s effectId=%s",
                  self._saved_switch_state, self._saved_effect_id)
 
         client.set_switch_state(SWITCH_MANUAL)
-        client.preview_solid_red()
+        client.preview_effect(EFFECTS[effect_name])
+
+    def _apply_effect_and_reset_timer(self, effect_name: str):
+        """Apply a new effect while already in Manual mode, then reset timer."""
+        try:
+            client = TrimlightClient(self.config)
+            client.preview_effect(EFFECTS[effect_name])
+        except Exception as exc:
+            self._log(f"Override apply failed: {exc}", level="error")
+        with self._lock:
+            if self._state == self.ALARMED:
+                self._reset_timer()
 
     def _restore(self):
+        """Restore the pre-alarm device state."""
         with self._lock:
             if self._state != self.ALARMED:
                 return
@@ -293,7 +347,6 @@ class AlarmStateMachine:
             saved  = self._saved_switch_state
 
             if saved == SWITCH_TIMER:
-                # Turn off first to clear the preview, then resume schedule
                 self._log("Restoring Timer mode (schedule will resume)")
                 client.set_switch_state(SWITCH_OFF)
                 time.sleep(0.5)
@@ -304,37 +357,38 @@ class AlarmStateMachine:
                 client.view_effect(self._saved_effect_id)
 
             elif saved == SWITCH_OFF:
-                self._log("Previous state was Off — turning off")
+                self._log("Restoring Off state")
                 client.set_switch_state(SWITCH_OFF)
 
             else:
-                self._log("Previous state unknown — defaulting to Timer mode", level="warning")
+                self._log("Previous state unknown — defaulting to Timer", level="warning")
                 client.set_switch_state(SWITCH_OFF)
                 time.sleep(0.5)
                 client.set_switch_state(SWITCH_TIMER)
 
         except Exception as exc:
-            self._log(f"Restore failed: {exc} — lights may remain red", level="error")
+            self._log(f"Restore failed: {exc} — lights may remain on", level="error")
             log.exception("Restore error")
 
         with self._lock:
-            self._state = self.IDLE
+            self._state        = self.IDLE
+            self._current_effect = None
             self.last_restored = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._log("Lights restored — system idle")
 
     def _reset_timer(self):
-        """(Re)start the restore countdown.  Call under self._lock."""
+        """(Re)start the restore countdown. Call under self._lock."""
         if self._timer:
             self._timer.cancel()
         self._timer = threading.Timer(self.config.alarm_timeout, self._restore)
         self._timer.daemon = True
         self._timer.start()
 
-    def _wait_and_retrigger(self):
+    def _wait_and_retrigger(self, effect_name: str):
         for _ in range(50):
             time.sleep(0.1)
             if self._state == self.IDLE:
-                self.trigger()
+                self.trigger(effect_name)
                 return
         log.warning("Timed out waiting for restore — dropping re-trigger")
 
@@ -342,7 +396,9 @@ class AlarmStateMachine:
         with self._lock:
             return {
                 "alarm_state":    self._state,
+                "current_effect": self._current_effect,
                 "last_triggered": self.last_triggered,
+                "last_effect":    self.last_effect,
                 "last_restored":  self.last_restored,
             }
 
@@ -380,8 +436,7 @@ _HTML = """\
     }}
     .stat-row {{
       display: flex; justify-content: space-between; align-items: center;
-      padding: 0.45rem 0; border-bottom: 1px solid #263347;
-      font-size: 0.875rem;
+      padding: 0.45rem 0; border-bottom: 1px solid #263347; font-size: 0.875rem;
     }}
     .stat-row:last-child {{ border-bottom: none; }}
     .stat-label {{ color: #94a3b8; }}
@@ -393,14 +448,22 @@ _HTML = """\
     .badge-idle      {{ background: #1e3a5f; color: #38bdf8; }}
     .badge-alarmed   {{ background: #450a0a; color: #f87171; }}
     .badge-restoring {{ background: #431407; color: #fb923c; }}
+    .field label {{
+      display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 0.4rem;
+    }}
+    select {{
+      width: 100%; padding: 0.6rem 0.75rem;
+      background: #0f172a; border: 1px solid #334155;
+      border-radius: 8px; color: #f1f5f9; font-size: 0.9rem; margin-bottom: 0.75rem;
+    }}
+    select:focus {{ outline: none; border-color: #f97316; }}
     button {{
-      width: 100%; padding: 0.75rem 1rem;
-      background: #dc2626; color: #fff;
+      width: 100%; padding: 0.7rem 1rem;
+      background: #ea580c; color: #fff;
       border: none; border-radius: 8px; font-size: 0.95rem;
       font-weight: 600; cursor: pointer; transition: background 0.15s;
-      margin-top: 0.5rem;
     }}
-    button:hover {{ background: #b91c1c; }}
+    button:hover {{ background: #c2410c; }}
     button:disabled {{ background: #334155; color: #64748b; cursor: not-allowed; }}
     #result {{
       margin-top: 0.75rem; padding: 0.65rem 0.9rem;
@@ -408,6 +471,28 @@ _HTML = """\
     }}
     #result.ok  {{ background: #052e16; color: #4ade80; display: block; }}
     #result.err {{ background: #450a0a; color: #f87171; display: block; }}
+    .url-table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+    .url-table td {{ padding: 0.4rem 0.5rem; border-bottom: 1px solid #263347; vertical-align: top; }}
+    .url-table tr:last-child td {{ border-bottom: none; }}
+    .url-table td:first-child {{ color: #94a3b8; white-space: nowrap; padding-right: 1rem; }}
+    .url-code {{
+      font-family: monospace; color: #fb923c;
+      background: #0f172a; padding: 0.2rem 0.5rem; border-radius: 4px;
+      word-break: break-all;
+    }}
+    .fx-table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+    .fx-table th {{
+      text-align: left; padding: 0.35rem 0.5rem;
+      color: #64748b; font-weight: 500; border-bottom: 1px solid #334155;
+    }}
+    .fx-table td {{ padding: 0.4rem 0.5rem; border-bottom: 1px solid #263347; }}
+    .fx-table tr:last-child td {{ border-bottom: none; }}
+    .swatch {{
+      display: inline-block; width: 14px; height: 14px;
+      border-radius: 50%; vertical-align: middle; margin-right: 6px;
+      border: 1px solid rgba(255,255,255,0.15);
+    }}
+    .fx-name {{ font-family: monospace; color: #fb923c; }}
     .log-list {{ list-style: none; }}
     .log-list li {{
       display: flex; gap: 1rem; padding: 0.45rem 0;
@@ -419,11 +504,6 @@ _HTML = """\
     .log-error   {{ color: #f87171; }}
     .log-warning {{ color: #fb923c; }}
     .empty       {{ color: #475569; font-size: 0.85rem; font-style: italic; }}
-    .webhook-url {{
-      font-family: monospace; font-size: 0.8rem; color: #fb923c;
-      background: #1a1a2e; padding: 0.5rem 0.75rem;
-      border-radius: 6px; margin-top: 0.75rem; word-break: break-all;
-    }}
   </style>
 </head>
 <body>
@@ -439,16 +519,16 @@ _HTML = """\
         <span class="badge badge-{state_class}">{state_upper}</span>
       </div>
       <div class="stat-row">
+        <span class="stat-label">Active Effect</span>
+        <span class="stat-value">{current_effect_disp}</span>
+      </div>
+      <div class="stat-row">
         <span class="stat-label">Device ID</span>
         <span class="stat-value">{device_id_short}&hellip;</span>
       </div>
       <div class="stat-row">
         <span class="stat-label">Alarm Timeout</span>
         <span class="stat-value">{alarm_timeout}s</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Trigger Key</span>
-        <span class="stat-value">{trigger_key}</span>
       </div>
     </div>
 
@@ -457,37 +537,57 @@ _HTML = """\
       <h2>Last Alarm</h2>
       <div class="stat-row">
         <span class="stat-label">Triggered</span>
-        <span class="stat-value">
-          <time data-utc="{last_triggered}">{last_triggered_disp}</time>
-        </span>
+        <span class="stat-value"><time data-utc="{last_triggered}">{last_triggered_disp}</time></span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Effect Used</span>
+        <span class="stat-value">{last_effect_disp}</span>
       </div>
       <div class="stat-row">
         <span class="stat-label">Restored</span>
-        <span class="stat-value">
-          <time data-utc="{last_restored}">{last_restored_disp}</time>
-        </span>
+        <span class="stat-value"><time data-utc="{last_restored}">{last_restored_disp}</time></span>
       </div>
     </div>
 
     <!-- Test card -->
     <div class="card">
-      <h2>Test &mdash; Simulate Animal Detection</h2>
-      <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:0.75rem">
-        Triggers the alarm immediately, same as a real UniFi Protect webhook.
-        Lights will go red and auto-restore after {alarm_timeout}s.
-      </p>
-      <button id="triggerBtn" onclick="triggerAlarm()">&#128308; Trigger Alarm Now</button>
+      <h2>Test &mdash; Simulate Detection</h2>
+      <div class="field">
+        <label for="effectSel">Effect</label>
+        <select id="effectSel">
+          {effect_options}
+        </select>
+      </div>
+      <button id="triggerBtn" onclick="triggerAlarm()">&#9654; Trigger Now</button>
       <div id="result"></div>
     </div>
   </div>
 
-  <!-- Webhook info -->
+  <!-- Webhook URLs -->
   <div class="card" style="margin-bottom:1.25rem">
-    <h2>UniFi Protect Webhook URL</h2>
-    <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:0.5rem">
-      Set this URL in Protect &rarr; Alarm Manager &rarr; Webhook action (POST method):
+    <h2>UniFi Protect Webhook URLs</h2>
+    <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:0.75rem">
+      In Protect &rarr; Alarm Manager, create one alarm per detection type and set
+      the webhook URL to the corresponding URL below (POST method).
     </p>
-    <div class="webhook-url" id="webhookUrl">http://&lt;this-host&gt;:{port}/webhook</div>
+    <table class="url-table">
+      {webhook_rows}
+    </table>
+  </div>
+
+  <!-- Effects reference -->
+  <div class="card" style="margin-bottom:1.25rem">
+    <h2>Available Effects</h2>
+    <table class="fx-table">
+      <thead>
+        <tr>
+          <th>Name</th><th>Label</th><th>Mode</th><th>Speed</th><th>Brightness</th>
+        </tr>
+      </thead>
+      <tbody>
+        {effects_rows}
+      </tbody>
+    </table>
   </div>
 
   <!-- Activity log -->
@@ -502,18 +602,20 @@ _HTML = """\
     // Localise UTC timestamps
     document.querySelectorAll('time[data-utc]').forEach(el => {{
       const v = el.dataset.utc;
-      if (v && v !== '—') {{
+      if (v && v !== '\u2014') {{
         try {{ el.textContent = new Date(v).toLocaleString(); }} catch(e) {{}}
       }}
     }});
 
-    // Fill in the actual host
-    document.getElementById('webhookUrl').textContent =
-      'http://' + location.hostname + ':{port}/webhook';
+    // Replace <host> placeholder in webhook URLs with actual hostname
+    document.querySelectorAll('.url-code[data-url]').forEach(el => {{
+      el.textContent = el.dataset.url.replace('<host>', location.hostname);
+    }});
 
     async function triggerAlarm() {{
       const btn    = document.getElementById('triggerBtn');
       const result = document.getElementById('result');
+      const effect = document.getElementById('effectSel').value;
       btn.disabled = true;
       btn.textContent = 'Triggering\u2026';
       result.className = '';
@@ -523,12 +625,12 @@ _HTML = """\
         const resp = await fetch('/test', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{}})
+          body: JSON.stringify({{ effect }})
         }});
         const data = await resp.json();
         if (resp.ok && data.triggered) {{
           result.className = 'ok';
-          result.textContent = '\u2713 Alarm triggered — lights going red';
+          result.textContent = '\u2713 Triggered: ' + (data.effect_label || effect);
           setTimeout(() => location.reload(), 3000);
         }} else {{
           result.className = 'err';
@@ -539,11 +641,10 @@ _HTML = """\
         result.textContent = '\u2717 Request error: ' + err.message;
       }} finally {{
         btn.disabled = false;
-        btn.textContent = '&#128308; Trigger Alarm Now';
+        btn.textContent = '\u25b6 Trigger Now';
       }}
     }}
 
-    // Auto-refresh every 10s while alarmed
     const state = '{state_class}';
     if (state !== 'idle') setTimeout(() => location.reload(), 10000);
     else setTimeout(() => location.reload(), 30000);
@@ -563,8 +664,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.debug("HTTP %s — " + fmt, self.address_string(), *args)
 
-    # -- helpers ------------------------------------------------------------
-
     def _json(self, code: int, body: dict):
         data = json.dumps(body).encode()
         self.send_response(code)
@@ -583,24 +682,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
-        if not length:
-            return {}
-        return json.loads(self.rfile.read(length))
+        return json.loads(self.rfile.read(length)) if length else {}
+
+    def _effect_from_query(self) -> str:
+        """Extract ?effect=<name> from the request path."""
+        params = parse_qs(urlparse(self.path).query)
+        name   = params.get("effect", [DEFAULT_EFFECT])[0]
+        return name if name in EFFECTS else DEFAULT_EFFECT
 
     # -- routing ------------------------------------------------------------
 
     def do_GET(self):
-        if self.path in ("/", "/status"):
+        path = urlparse(self.path).path
+        if path in ("/", "/status"):
             self._serve_ui()
-        elif self.path == "/health":
+        elif path == "/health":
             self._json(200, {"status": "ok", **self.alarm_sm.get_state_dict()})
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path == "/webhook":
+        path = urlparse(self.path).path
+        if path == "/webhook":
             self._handle_webhook()
-        elif self.path == "/test":
+        elif path == "/test":
             self._handle_test()
         else:
             self._json(404, {"error": "not found"})
@@ -610,40 +715,78 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def _serve_ui(self):
         sd    = self.alarm_sm.get_state_dict()
         state = sd["alarm_state"]
+        port  = self.config.webhook_port
 
+        # Effect selector options
+        options = "\n          ".join(
+            f'<option value="{k}">{v["label"]}</option>'
+            for k, v in EFFECTS.items()
+        )
+
+        # Webhook URL table rows (placeholder host replaced in JS)
+        wh_rows = "\n      ".join(
+            f'<tr><td>{v["label"]}</td>'
+            f'<td><span class="url-code" data-url="http://<host>:{port}/webhook?effect={k}">'
+            f'http://&lt;host&gt;:{port}/webhook?effect={k}</span></td></tr>'
+            for k, v in EFFECTS.items()
+        )
+
+        # Effects reference table rows
+        def mode_label(m):
+            return {0: "Static", 1: "Chase Fwd", 2: "Chase Bwd",
+                    6: "Breath", 15: "Strobe", 16: "Fade"}.get(m, str(m))
+
+        fx_rows = "\n        ".join(
+            f'<tr>'
+            f'<td><span class="swatch" style="background:#{v["color"]:06X}"></span>'
+            f'<span class="fx-name">{k}</span></td>'
+            f'<td>{v["label"]}</td>'
+            f'<td>{mode_label(v["mode"])}</td>'
+            f'<td>{v["speed"]}</td>'
+            f'<td>{v["brightness"]}</td>'
+            f'</tr>'
+            for k, v in EFFECTS.items()
+        )
+
+        # Activity log rows
         logs = self.alarm_sm.activity_log
         if logs:
-            rows = []
-            for ts, level, msg in logs:
-                css = {"error": "log-error", "warning": "log-warning"}.get(level, "log-msg")
-                rows.append(
-                    f'<li><time class="log-ts" data-utc="{ts}">{ts}</time>'
-                    f'<span class="{css}">{msg}</span></li>'
-                )
-            items = "\n      ".join(rows)
+            log_items = "\n      ".join(
+                f'<li><time class="log-ts" data-utc="{ts}">{ts}</time>'
+                f'<span class="{"log-error" if lv == "error" else "log-warning" if lv == "warning" else "log-msg"}">{msg}</span></li>'
+                for ts, lv, msg in logs
+            )
         else:
-            items = '<li><span class="empty">No activity yet</span></li>'
+            log_items = '<li><span class="empty">No activity yet</span></li>'
+
+        current_eff = sd["current_effect"]
+        last_eff    = sd["last_effect"]
 
         html = _HTML.format(
-            port             = self.config.webhook_port,
-            state_upper      = state.upper(),
-            state_class      = state,
-            device_id_short  = self.config.device_id[:16],
-            alarm_timeout    = self.config.alarm_timeout,
-            trigger_key      = self.config.trigger_key,
-            last_triggered   = sd["last_triggered"] or "—",
+            port                = port,
+            state_upper         = state.upper(),
+            state_class         = state,
+            current_effect_disp = EFFECTS[current_eff]["label"] if current_eff else "—",
+            device_id_short     = self.config.device_id[:16],
+            alarm_timeout       = self.config.alarm_timeout,
+            last_triggered      = sd["last_triggered"] or "\u2014",
             last_triggered_disp = sd["last_triggered"] or "Never",
-            last_restored    = sd["last_restored"] or "—",
+            last_effect_disp    = EFFECTS[last_eff]["label"] if last_eff else "—",
+            last_restored       = sd["last_restored"] or "\u2014",
             last_restored_disp  = sd["last_restored"] or "Never",
-            activity_items   = items,
+            effect_options      = options,
+            webhook_rows        = wh_rows,
+            effects_rows        = fx_rows,
+            activity_items      = log_items,
         )
         self._html(html)
 
     # -- webhook handler ----------------------------------------------------
 
     def _handle_webhook(self):
+        effect_name = self._effect_from_query()
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        log.debug("Webhook raw (%d bytes): %s", len(raw), raw[:500])
+        log.debug("Webhook raw (%d bytes) effect=%s: %s", len(raw), effect_name, raw[:400])
 
         try:
             data = json.loads(raw) if raw else {}
@@ -662,33 +805,51 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "expected JSON object"})
             return
 
-        log.debug("Webhook parsed: %s", json.dumps(data))
-
+        # Validate this is a real UniFi Protect alarm payload (has triggers)
         alarm    = data.get("alarm") or data.get("Alarm") or {}
         triggers = []
         if isinstance(alarm, dict):
             triggers = alarm.get("triggers") or alarm.get("Triggers") or []
 
-        matched = any(
-            t.get("key") == self.config.trigger_key or
-            t.get("Key") == self.config.trigger_key
-            for t in triggers if isinstance(t, dict)
-        )
+        if not triggers:
+            log.debug("Webhook: no triggers in payload — ignoring")
+            self._json(200, {"triggered": False, "reason": "no triggers in payload"})
+            return
 
-        if matched:
-            log.info("Webhook trigger matched: key=%s", self.config.trigger_key)
-            threading.Thread(target=self.alarm_sm.trigger, daemon=True).start()
-            self._json(200, {"triggered": True})
-        else:
-            log.debug("Webhook: trigger key '%s' not matched", self.config.trigger_key)
-            self._json(200, {"triggered": False})
+        trigger_keys = [t.get("key") or t.get("Key", "") for t in triggers if isinstance(t, dict)]
+        log.info("Webhook trigger keys=%s effect=%s", trigger_keys, effect_name)
+
+        threading.Thread(
+            target=self.alarm_sm.trigger,
+            args=(effect_name,), daemon=True,
+        ).start()
+        self._json(200, {
+            "triggered":    True,
+            "effect":       effect_name,
+            "effect_label": EFFECTS[effect_name]["label"],
+            "trigger_keys": trigger_keys,
+        })
 
     # -- test handler -------------------------------------------------------
 
     def _handle_test(self):
-        log.info("Test trigger from UI")
-        threading.Thread(target=self.alarm_sm.trigger, daemon=True).start()
-        self._json(200, {"triggered": True})
+        try:
+            data = self._read_json()
+        except Exception:
+            data = {}
+        effect_name = data.get("effect", DEFAULT_EFFECT)
+        if effect_name not in EFFECTS:
+            effect_name = DEFAULT_EFFECT
+        log.info("Test trigger from UI: effect=%s", effect_name)
+        threading.Thread(
+            target=self.alarm_sm.trigger,
+            args=(effect_name,), daemon=True,
+        ).start()
+        self._json(200, {
+            "triggered":    True,
+            "effect":       effect_name,
+            "effect_label": EFFECTS[effect_name]["label"],
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -710,10 +871,9 @@ def main():
     log.info("  Device ID     : %s", config.device_id)
     log.info("  Port          : %d", config.webhook_port)
     log.info("  Alarm timeout : %ds", config.alarm_timeout)
-    log.info("  Trigger key   : %s", config.trigger_key)
+    log.info("  Effects       : %s", ", ".join(EFFECTS))
 
     alarm_sm = AlarmStateMachine(config)
-
     WebhookHandler.alarm_sm = alarm_sm
     WebhookHandler.config   = config
 
@@ -728,7 +888,6 @@ def main():
 
     log.info("Listening on 0.0.0.0:%d", config.webhook_port)
     log.info("Status page → http://0.0.0.0:%d/", config.webhook_port)
-    log.info("Webhook URL → http://0.0.0.0:%d/webhook", config.webhook_port)
     server.serve_forever()
     log.info("Server stopped")
 
