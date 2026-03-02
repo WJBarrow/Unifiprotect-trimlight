@@ -3,6 +3,6 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "${WEBHOOK_PORT:-8080}:${WEBHOOK_PORT:-8080}"
+      - "${WEBHOOK_PORT:-8484}:${WEBHOOK_PORT:-8484}"
     env_file:
       - .env

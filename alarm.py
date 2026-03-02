@@ -20,7 +20,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -31,36 +31,33 @@ log = logging.getLogger("alarm")
 COLOR_RED = 16711680
 
 # Switch states
-SWITCH_OFF = 0
+SWITCH_OFF    = 0
 SWITCH_MANUAL = 1
-SWITCH_TIMER = 2
+SWITCH_TIMER  = 2
+
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 class Config:
-    """Read and validate configuration from environment variables."""
-
     def __init__(self):
-        self.client_id = os.environ.get("TRIMLIGHT_CLIENT_ID", "")
+        self.client_id     = os.environ.get("TRIMLIGHT_CLIENT_ID", "")
         self.client_secret = os.environ.get("TRIMLIGHT_CLIENT_SECRET", "")
-        self.device_id = os.environ.get("TRIMLIGHT_DEVICE_ID", "")
-        self.api_url = os.environ.get(
+        self.device_id     = os.environ.get("TRIMLIGHT_DEVICE_ID", "")
+        self.api_url       = os.environ.get(
             "TRIMLIGHT_API_URL", "https://trimlight.ledhue.com/trimlight"
         )
-        self.webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
+        self.webhook_port  = int(os.environ.get("WEBHOOK_PORT", "8484"))
         self.alarm_timeout = int(os.environ.get("ALARM_TIMEOUT", "30"))
-        self.trigger_key = os.environ.get("TRIGGER_KEY", "animal")
-        self.log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+        self.trigger_key   = os.environ.get("TRIGGER_KEY", "animal")
+        self.log_level     = os.environ.get("LOG_LEVEL", "INFO").upper()
 
     def validate(self):
-        missing = []
-        if not self.client_id:
-            missing.append("TRIMLIGHT_CLIENT_ID")
-        if not self.client_secret:
-            missing.append("TRIMLIGHT_CLIENT_SECRET")
-        if not self.device_id:
-            missing.append("TRIMLIGHT_DEVICE_ID")
+        missing = [k for k, v in [
+            ("TRIMLIGHT_CLIENT_ID",     self.client_id),
+            ("TRIMLIGHT_CLIENT_SECRET", self.client_secret),
+            ("TRIMLIGHT_DEVICE_ID",     self.device_id),
+        ] if not v]
         if missing:
             sys.exit("ERROR: Required environment variables not set: " + ", ".join(missing))
         if self.alarm_timeout < 1:
@@ -70,164 +67,126 @@ class Config:
 # ---------------------------------------------------------------------------
 # Trimlight Cloud API client
 # ---------------------------------------------------------------------------
-class TrimlightClient:
-    """Communicate with a Trimlight Edge controller via the cloud REST API.
+class APIError(Exception):
+    """Error communicating with the Trimlight cloud API."""
 
-    API docs: https://trimlight.com/hubfs/Manuals/Trimlight_Edge_API_Documentation%208192022.pdf
-    Base URL: POST https://trimlight.ledhue.com/trimlight/<path>
-    Auth:     HMAC-SHA256(clientSecret, "Trimlight|<clientId>|<timestamp>")
+
+class TrimlightClient:
+    """
+    Trimlight Edge cloud REST API.
+
+    Docs:  https://trimlight.com/hubfs/Manuals/Trimlight_Edge_API_Documentation%208192022.pdf
+    Base:  POST https://trimlight.ledhue.com/trimlight/<path>
+    Auth:  HMAC-SHA256("Trimlight|<clientId>|<timestamp>", clientSecret) → base64
     """
 
-    REQUEST_TIMEOUT = 15  # seconds
+    REQUEST_TIMEOUT = 15
 
     def __init__(self, config: Config):
         self.config = config
 
-    # -- auth ---------------------------------------------------------------
-
     def _auth_headers(self) -> dict:
-        """Build the required authentication headers."""
         timestamp = str(int(time.time() * 1000))
-        message = f"Trimlight|{self.config.client_id}|{timestamp}"
-        mac = hmac.new(
-            self.config.client_secret.encode("utf-8"),
-            message.encode("utf-8"),
+        message   = f"Trimlight|{self.config.client_id}|{timestamp}"
+        mac       = hmac.new(
+            self.config.client_secret.encode(),
+            message.encode(),
             hashlib.sha256,
         ).digest()
-        token = base64.b64encode(mac).decode("utf-8")
         return {
-            "authorization": token,
-            "S-ClientId": self.config.client_id,
-            "S-Timestamp": timestamp,
-            "Content-Type": "application/json",
+            "authorization": base64.b64encode(mac).decode(),
+            "S-ClientId":    self.config.client_id,
+            "S-Timestamp":   timestamp,
+            "Content-Type":  "application/json",
         }
 
-    # -- low-level request --------------------------------------------------
-
     def _post(self, path: str, body: dict) -> dict:
-        """Send a POST request to the Trimlight cloud API."""
-        url = self.config.api_url + path
-        data = json.dumps(body).encode("utf-8")
-        headers = self._auth_headers()
-
+        url  = self.config.api_url + path
+        data = json.dumps(body).encode()
         log.debug("API POST %s  body=%s", path, json.dumps(body))
-        req = Request(url, data=data, headers=headers, method="POST")
+        req = Request(url, data=data, headers=self._auth_headers(), method="POST")
         try:
             with urlopen(req, timeout=self.REQUEST_TIMEOUT) as resp:
-                raw = resp.read()
-                result = json.loads(raw)
+                result = json.loads(resp.read())
                 log.debug("API response: %s", json.dumps(result))
                 if result.get("code") != 0:
                     raise APIError(
-                        f"API error: code={result.get('code')} desc={result.get('desc')}"
+                        f"API error code={result.get('code')} desc={result.get('desc')}"
                     )
                 return result
         except HTTPError as exc:
-            body_text = exc.read().decode("utf-8", errors="replace")
-            raise APIError(f"HTTP {exc.code}: {body_text}") from exc
+            raise APIError(f"HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
         except URLError as exc:
             raise APIError(f"Request failed: {exc.reason}") from exc
 
+    def _now_date(self) -> dict:
+        now     = datetime.now()
+        weekday = now.isoweekday()              # Mon=1 … Sun=7
+        return {
+            "year":    now.year - 2000,
+            "month":   now.month,
+            "day":     now.day,
+            "weekday": 1 if weekday == 7 else weekday + 1,   # Sun=1 … Sat=7
+            "hours":   now.hour,
+            "minutes": now.minute,
+            "seconds": now.second,
+        }
+
     # -- high-level commands ------------------------------------------------
 
-    def get_device_detail(self) -> dict:
-        """Get device detail data (API #4)."""
-        now = datetime.now()
-        weekday = now.isoweekday()  # Mon=1..Sun=7
-        # API uses: SUNDAY=1, MONDAY=2, ..., SATURDAY=7
-        api_weekday = 1 if weekday == 7 else weekday + 1
+    def notify_update_shadow(self):
+        """Ask the device to push its latest state to the cloud (API #25)."""
+        log.debug("notify_update_shadow")
+        self._post("/v1/oauth/resources/device/notify-update-shadow", {
+            "deviceId":    self.config.device_id,
+            "currentDate": self._now_date(),
+        })
 
+    def get_device_detail(self) -> dict:
+        """Fetch current mode, connectivity, and running effect (API #4)."""
         result = self._post("/v1/oauth/resources/device/get", {
-            "deviceId": self.config.device_id,
-            "currentDate": {
-                "year": now.year - 2000,
-                "month": now.month,
-                "day": now.day,
-                "weekday": api_weekday,
-                "hours": now.hour,
-                "minutes": now.minute,
-                "seconds": now.second,
-            },
+            "deviceId":    self.config.device_id,
+            "currentDate": self._now_date(),
         })
         payload = result.get("payload", {})
         log.info(
             "Device detail: switchState=%s connectivity=%s",
-            payload.get("switchState"),
-            payload.get("connectivity"),
+            payload.get("switchState"), payload.get("connectivity"),
         )
         return payload
 
     def set_switch_state(self, state: int):
-        """Set device switch state (API #5).
-
-        0 = light off, 1 = manual mode, 2 = timer mode.
-        """
+        """0=Off  1=Manual  2=Timer (API #5)."""
         labels = {0: "Off", 1: "Manual", 2: "Timer"}
-        log.info("Setting switch state → %s (%d)", labels.get(state, "?"), state)
+        log.info("set_switch_state → %s (%d)", labels.get(state, "?"), state)
         self._post("/v1/oauth/resources/device/update", {
             "deviceId": self.config.device_id,
-            "payload": {"switchState": state},
+            "payload":  {"switchState": state},
         })
 
-    def preview_custom_effect(self, pixels: list, mode: int = 0,
-                              speed: int = 100, brightness: int = 255):
-        """Preview a custom effect on the device (API #11).
-
-        mode 0 = STATIC, see docs for other modes.
-        """
-        log.info("Previewing custom effect: mode=%d pixels=%d", mode, len(pixels))
+    def preview_solid_red(self):
+        """Preview a solid-red static custom effect (API #11)."""
+        log.info("preview_solid_red")
         self._post("/v1/oauth/resources/device/effect/preview", {
             "deviceId": self.config.device_id,
             "payload": {
-                "category": 2,  # Edge uses category 2 for custom effects (docs say 1, device expects 2)
-                "mode": mode,
-                "speed": speed,
-                "brightness": brightness,
-                "pixels": pixels,
+                "category":   2,        # Edge uses category 2 (docs say 1, device expects 2)
+                "mode":       0,        # STATIC
+                "speed":      100,
+                "brightness": 255,
+                "pixels": [
+                    {"index": 0, "count": 1, "color": COLOR_RED, "disable": False},
+                ],
             },
         })
 
     def view_effect(self, effect_id: int):
-        """Check out / activate a saved effect by ID (API #13)."""
-        log.info("Activating saved effect ID %d", effect_id)
+        """Activate a saved effect by ID (API #13)."""
+        log.info("view_effect id=%d", effect_id)
         self._post("/v1/oauth/resources/device/effect/view", {
             "deviceId": self.config.device_id,
-            "payload": {"id": effect_id},
+            "payload":  {"id": effect_id},
         })
-
-    def notify_update_shadow(self):
-        """Notify device to report latest shadow data (API #25)."""
-        now = datetime.now()
-        weekday = now.isoweekday()
-        api_weekday = 1 if weekday == 7 else weekday + 1
-
-        log.debug("Notifying device to update shadow data")
-        self._post("/v1/oauth/resources/device/notify-update-shadow", {
-            "deviceId": self.config.device_id,
-            "currentDate": {
-                "year": now.year - 2000,
-                "month": now.month,
-                "day": now.day,
-                "weekday": api_weekday,
-                "hours": now.hour,
-                "minutes": now.minute,
-                "seconds": now.second,
-            },
-        })
-
-    def activate_red(self):
-        """Set all lights to solid red."""
-        self.set_switch_state(SWITCH_MANUAL)
-        self.preview_custom_effect(
-            pixels=[{"index": 0, "count": 1, "color": COLOR_RED, "disable": False}],
-            mode=0,       # STATIC
-            speed=100,
-            brightness=255,
-        )
-
-
-class APIError(Exception):
-    """Error communicating with the Trimlight cloud API."""
 
 
 # ---------------------------------------------------------------------------
@@ -237,25 +196,38 @@ class AlarmStateMachine:
     """
     IDLE ──trigger──▸ ALARMED ──timeout──▸ RESTORING ──done──▸ IDLE
 
-    Debounce: re-triggering while ALARMED resets the timer without resending
-    the red command.
+    Debounce: re-triggering while ALARMED resets the timeout timer.
     """
 
-    IDLE = "idle"
-    ALARMED = "alarmed"
-    RESTORING = "restoring"
+    IDLE       = "idle"
+    ALARMED    = "alarmed"
+    RESTORING  = "restoring"
+    MAX_LOG    = 30
 
     def __init__(self, config: Config):
-        self.config = config
-        self._state = self.IDLE
-        self._lock = threading.Lock()
-        self._timer = None
+        self.config              = config
+        self._state              = self.IDLE
+        self._lock               = threading.Lock()
+        self._timer              = None
         self._saved_switch_state = None
-        self._saved_effect_id = None
+        self._saved_effect_id    = None
+        self.last_triggered      = None   # ISO string
+        self.last_restored       = None   # ISO string
+        self.activity_log        = []     # [(ts_str, level, message), …]
 
     @property
     def state(self) -> str:
         return self._state
+
+    # -- activity log -------------------------------------------------------
+
+    def _log(self, message: str, level: str = "info"):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._lock:
+            self.activity_log.insert(0, (ts, level, message))
+            if len(self.activity_log) > self.MAX_LOG:
+                self.activity_log = self.activity_log[:self.MAX_LOG]
+        getattr(log, level, log.info)(message)
 
     # -- public interface ---------------------------------------------------
 
@@ -263,179 +235,460 @@ class AlarmStateMachine:
         """Called when the webhook fires.  Thread-safe."""
         with self._lock:
             if self._state == self.ALARMED:
-                log.info("Already alarmed — resetting timer (debounce)")
+                self._log("Already alarmed — resetting timer (debounce)")
                 self._reset_timer()
                 return
             if self._state == self.RESTORING:
-                log.info("Restore in progress — will re-alarm after")
+                self._log("Restore in progress — queuing re-alarm")
                 threading.Thread(target=self._wait_and_retrigger, daemon=True).start()
                 return
-            # IDLE → ALARMED
             self._state = self.ALARMED
-            log.info("State → ALARMED")
+            self.last_triggered = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Outside the lock: talk to the cloud API (blocking I/O)
+        self._log("Animal detected — activating alarm")
+
         try:
             self._activate_alarm()
-        except Exception:
-            log.exception("Failed to activate alarm")
+        except Exception as exc:
+            self._log(f"Failed to activate alarm: {exc}", level="error")
+            log.exception("Alarm activation error")
             with self._lock:
                 self._state = self.IDLE
             return
 
+        self._log(f"Lights set to solid red — restoring in {self.config.alarm_timeout}s")
         with self._lock:
             self._reset_timer()
 
     # -- internals ----------------------------------------------------------
 
     def _activate_alarm(self):
-        """Query current state, switch to manual, set solid red."""
         client = TrimlightClient(self.config)
-        # Request fresh data from the device
         try:
             client.notify_update_shadow()
-            time.sleep(1)  # give the device a moment to report
+            time.sleep(1)
         except Exception:
-            log.debug("notify_update_shadow failed (non-fatal), continuing")
+            log.debug("notify_update_shadow failed (non-fatal)")
 
         detail = client.get_device_detail()
         self._saved_switch_state = detail.get("switchState")
-        current_effect = detail.get("currentEffect") or {}
-        effect_id = current_effect.get("id") if isinstance(current_effect, dict) else None
-        self._saved_effect_id = effect_id if effect_id is not None and effect_id >= 0 else None
-        log.info(
-            "Saved state: switchState=%s effectId=%s",
-            self._saved_switch_state,
-            self._saved_effect_id,
-        )
-        client.activate_red()
+        effect = detail.get("currentEffect") or {}
+        eid    = effect.get("id") if isinstance(effect, dict) else None
+        self._saved_effect_id = eid if eid is not None and eid >= 0 else None
+        log.info("Saved state: switchState=%s effectId=%s",
+                 self._saved_switch_state, self._saved_effect_id)
+
+        client.set_switch_state(SWITCH_MANUAL)
+        client.preview_solid_red()
 
     def _restore(self):
-        """Restore the previous state."""
         with self._lock:
             if self._state != self.ALARMED:
                 return
             self._state = self.RESTORING
-            log.info("State → RESTORING")
 
+        self._log("Restoring previous state…")
         try:
             client = TrimlightClient(self.config)
-            if self._saved_switch_state == SWITCH_TIMER:
-                log.info("Restoring Timer mode (controller resumes schedule)")
-                client.set_switch_state(SWITCH_TIMER)
-            elif self._saved_switch_state == SWITCH_MANUAL:
-                log.info("Previous mode was Manual")
-                if self._saved_effect_id is not None:
-                    log.info("Restoring saved effect ID %d", self._saved_effect_id)
-                    client.view_effect(self._saved_effect_id)
-                else:
-                    log.info("No saved effect ID — switching to Timer mode")
-                    client.set_switch_state(SWITCH_TIMER)
-            elif self._saved_switch_state == SWITCH_OFF:
-                log.info("Previous mode was Off — turning lights off")
+            saved  = self._saved_switch_state
+
+            if saved == SWITCH_TIMER:
+                # Turn off first to clear the preview, then resume schedule
+                self._log("Restoring Timer mode (schedule will resume)")
                 client.set_switch_state(SWITCH_OFF)
-            else:
-                log.warning(
-                    "Unknown saved switchState=%s — defaulting to Timer",
-                    self._saved_switch_state,
-                )
+                time.sleep(0.5)
                 client.set_switch_state(SWITCH_TIMER)
-        except Exception:
-            log.exception("Failed to restore — lights may remain red")
+
+            elif saved == SWITCH_MANUAL and self._saved_effect_id is not None:
+                self._log(f"Restoring Manual effect ID {self._saved_effect_id}")
+                client.view_effect(self._saved_effect_id)
+
+            elif saved == SWITCH_OFF:
+                self._log("Previous state was Off — turning off")
+                client.set_switch_state(SWITCH_OFF)
+
+            else:
+                self._log("Previous state unknown — defaulting to Timer mode", level="warning")
+                client.set_switch_state(SWITCH_OFF)
+                time.sleep(0.5)
+                client.set_switch_state(SWITCH_TIMER)
+
+        except Exception as exc:
+            self._log(f"Restore failed: {exc} — lights may remain red", level="error")
+            log.exception("Restore error")
 
         with self._lock:
             self._state = self.IDLE
-            log.info("State → IDLE")
+            self.last_restored = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._log("Lights restored — system idle")
 
     def _reset_timer(self):
-        """(Re)start the restore timer.  Must be called under self._lock."""
-        if self._timer is not None:
+        """(Re)start the restore countdown.  Call under self._lock."""
+        if self._timer:
             self._timer.cancel()
-        log.info("Timer set: %ds", self.config.alarm_timeout)
         self._timer = threading.Timer(self.config.alarm_timeout, self._restore)
         self._timer.daemon = True
         self._timer.start()
 
     def _wait_and_retrigger(self):
-        """Wait for RESTORING to finish, then re-trigger."""
-        for _ in range(50):  # up to ~5 s
+        for _ in range(50):
             time.sleep(0.1)
             if self._state == self.IDLE:
                 self.trigger()
                 return
-        log.warning("Timed out waiting for restore to finish; dropping re-trigger")
+        log.warning("Timed out waiting for restore — dropping re-trigger")
+
+    def get_state_dict(self) -> dict:
+        with self._lock:
+            return {
+                "alarm_state":    self._state,
+                "last_triggered": self.last_triggered,
+                "last_restored":  self.last_restored,
+            }
 
 
 # ---------------------------------------------------------------------------
-# HTTP webhook handler
+# Web UI HTML template
+# ---------------------------------------------------------------------------
+_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trimlight Alarm</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 2rem;
+    }}
+    h1 {{ font-size: 1.75rem; color: #f97316; margin-bottom: 0.2rem; }}
+    .subtitle {{ color: #64748b; font-size: 0.875rem; margin-bottom: 2rem; }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.25rem; margin-bottom: 1.25rem;
+    }}
+    .card {{
+      background: #1e293b; border: 1px solid #334155;
+      border-radius: 12px; padding: 1.5rem;
+    }}
+    .card h2 {{
+      font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #64748b; margin-bottom: 1rem;
+    }}
+    .stat-row {{
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 0.45rem 0; border-bottom: 1px solid #263347;
+      font-size: 0.875rem;
+    }}
+    .stat-row:last-child {{ border-bottom: none; }}
+    .stat-label {{ color: #94a3b8; }}
+    .stat-value {{ color: #f1f5f9; font-weight: 500; font-family: monospace; font-size: 0.82rem; }}
+    .badge {{
+      display: inline-block; padding: 0.25rem 0.75rem;
+      border-radius: 9999px; font-size: 0.8rem; font-weight: 600;
+    }}
+    .badge-idle      {{ background: #1e3a5f; color: #38bdf8; }}
+    .badge-alarmed   {{ background: #450a0a; color: #f87171; }}
+    .badge-restoring {{ background: #431407; color: #fb923c; }}
+    button {{
+      width: 100%; padding: 0.75rem 1rem;
+      background: #dc2626; color: #fff;
+      border: none; border-radius: 8px; font-size: 0.95rem;
+      font-weight: 600; cursor: pointer; transition: background 0.15s;
+      margin-top: 0.5rem;
+    }}
+    button:hover {{ background: #b91c1c; }}
+    button:disabled {{ background: #334155; color: #64748b; cursor: not-allowed; }}
+    #result {{
+      margin-top: 0.75rem; padding: 0.65rem 0.9rem;
+      border-radius: 8px; font-size: 0.875rem; display: none;
+    }}
+    #result.ok  {{ background: #052e16; color: #4ade80; display: block; }}
+    #result.err {{ background: #450a0a; color: #f87171; display: block; }}
+    .log-list {{ list-style: none; }}
+    .log-list li {{
+      display: flex; gap: 1rem; padding: 0.45rem 0;
+      border-bottom: 1px solid #263347; font-size: 0.82rem;
+    }}
+    .log-list li:last-child {{ border-bottom: none; }}
+    time.log-ts {{ color: #475569; white-space: nowrap; flex-shrink: 0; }}
+    .log-msg     {{ color: #cbd5e1; }}
+    .log-error   {{ color: #f87171; }}
+    .log-warning {{ color: #fb923c; }}
+    .empty       {{ color: #475569; font-size: 0.85rem; font-style: italic; }}
+    .webhook-url {{
+      font-family: monospace; font-size: 0.8rem; color: #fb923c;
+      background: #1a1a2e; padding: 0.5rem 0.75rem;
+      border-radius: 6px; margin-top: 0.75rem; word-break: break-all;
+    }}
+  </style>
+</head>
+<body>
+  <h1>&#128308; Trimlight Alarm</h1>
+  <p class="subtitle">UniFi Protect &rarr; Trimlight Edge &mdash; port {port}</p>
+
+  <div class="grid">
+    <!-- Status card -->
+    <div class="card">
+      <h2>System Status</h2>
+      <div class="stat-row">
+        <span class="stat-label">Alarm State</span>
+        <span class="badge badge-{state_class}">{state_upper}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Device ID</span>
+        <span class="stat-value">{device_id_short}&hellip;</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Alarm Timeout</span>
+        <span class="stat-value">{alarm_timeout}s</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Trigger Key</span>
+        <span class="stat-value">{trigger_key}</span>
+      </div>
+    </div>
+
+    <!-- Last alarm card -->
+    <div class="card">
+      <h2>Last Alarm</h2>
+      <div class="stat-row">
+        <span class="stat-label">Triggered</span>
+        <span class="stat-value">
+          <time data-utc="{last_triggered}">{last_triggered_disp}</time>
+        </span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Restored</span>
+        <span class="stat-value">
+          <time data-utc="{last_restored}">{last_restored_disp}</time>
+        </span>
+      </div>
+    </div>
+
+    <!-- Test card -->
+    <div class="card">
+      <h2>Test &mdash; Simulate Animal Detection</h2>
+      <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:0.75rem">
+        Triggers the alarm immediately, same as a real UniFi Protect webhook.
+        Lights will go red and auto-restore after {alarm_timeout}s.
+      </p>
+      <button id="triggerBtn" onclick="triggerAlarm()">&#128308; Trigger Alarm Now</button>
+      <div id="result"></div>
+    </div>
+  </div>
+
+  <!-- Webhook info -->
+  <div class="card" style="margin-bottom:1.25rem">
+    <h2>UniFi Protect Webhook URL</h2>
+    <p style="font-size:0.82rem;color:#94a3b8;margin-bottom:0.5rem">
+      Set this URL in Protect &rarr; Alarm Manager &rarr; Webhook action (POST method):
+    </p>
+    <div class="webhook-url" id="webhookUrl">http://&lt;this-host&gt;:{port}/webhook</div>
+  </div>
+
+  <!-- Activity log -->
+  <div class="card">
+    <h2>Activity Log</h2>
+    <ul class="log-list">
+      {activity_items}
+    </ul>
+  </div>
+
+  <script>
+    // Localise UTC timestamps
+    document.querySelectorAll('time[data-utc]').forEach(el => {{
+      const v = el.dataset.utc;
+      if (v && v !== '—') {{
+        try {{ el.textContent = new Date(v).toLocaleString(); }} catch(e) {{}}
+      }}
+    }});
+
+    // Fill in the actual host
+    document.getElementById('webhookUrl').textContent =
+      'http://' + location.hostname + ':{port}/webhook';
+
+    async function triggerAlarm() {{
+      const btn    = document.getElementById('triggerBtn');
+      const result = document.getElementById('result');
+      btn.disabled = true;
+      btn.textContent = 'Triggering\u2026';
+      result.className = '';
+      result.style.display = 'none';
+
+      try {{
+        const resp = await fetch('/test', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{}})
+        }});
+        const data = await resp.json();
+        if (resp.ok && data.triggered) {{
+          result.className = 'ok';
+          result.textContent = '\u2713 Alarm triggered — lights going red';
+          setTimeout(() => location.reload(), 3000);
+        }} else {{
+          result.className = 'err';
+          result.textContent = '\u2717 ' + (data.error || 'Failed');
+        }}
+      }} catch (err) {{
+        result.className = 'err';
+        result.textContent = '\u2717 Request error: ' + err.message;
+      }} finally {{
+        btn.disabled = false;
+        btn.textContent = '&#128308; Trigger Alarm Now';
+      }}
+    }}
+
+    // Auto-refresh every 10s while alarmed
+    const state = '{state_class}';
+    if (state !== 'idle') setTimeout(() => location.reload(), 10000);
+    else setTimeout(() => location.reload(), 30000);
+  </script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# HTTP request handler
 # ---------------------------------------------------------------------------
 class WebhookHandler(BaseHTTPRequestHandler):
-    """Handles POST webhooks from UniFi Protect and GET health checks."""
+    alarm_sm: AlarmStateMachine = None
+    config:   Config            = None
 
-    # Attached by main() before the server starts
-    alarm_sm = None  # type: AlarmStateMachine
-    config = None  # type: Config
+    def log_message(self, fmt, *args):
+        log.debug("HTTP %s — " + fmt, self.address_string(), *args)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _json(self, code: int, body: dict):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _html(self, html: str):
+        data = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if not length:
+            return {}
+        return json.loads(self.rfile.read(length))
+
+    # -- routing ------------------------------------------------------------
 
     def do_GET(self):
-        """Health check."""
-        body = json.dumps({
-            "status": "ok",
-            "alarm_state": self.alarm_sm.state,
-        }).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        if self.path in ("/", "/status"):
+            self._serve_ui()
+        elif self.path == "/health":
+            self._json(200, {"status": "ok", **self.alarm_sm.get_state_dict()})
+        else:
+            self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        """Receive a UniFi Protect Alarm Manager webhook."""
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
-            self._respond(400, {"error": "Empty body"})
-            return
+        if self.path == "/webhook":
+            self._handle_webhook()
+        elif self.path == "/test":
+            self._handle_test()
+        else:
+            self._json(404, {"error": "not found"})
 
-        raw = self.rfile.read(content_length)
+    # -- status page --------------------------------------------------------
+
+    def _serve_ui(self):
+        sd    = self.alarm_sm.get_state_dict()
+        state = sd["alarm_state"]
+
+        logs = self.alarm_sm.activity_log
+        if logs:
+            rows = []
+            for ts, level, msg in logs:
+                css = {"error": "log-error", "warning": "log-warning"}.get(level, "log-msg")
+                rows.append(
+                    f'<li><time class="log-ts" data-utc="{ts}">{ts}</time>'
+                    f'<span class="{css}">{msg}</span></li>'
+                )
+            items = "\n      ".join(rows)
+        else:
+            items = '<li><span class="empty">No activity yet</span></li>'
+
+        html = _HTML.format(
+            port             = self.config.webhook_port,
+            state_upper      = state.upper(),
+            state_class      = state,
+            device_id_short  = self.config.device_id[:16],
+            alarm_timeout    = self.config.alarm_timeout,
+            trigger_key      = self.config.trigger_key,
+            last_triggered   = sd["last_triggered"] or "—",
+            last_triggered_disp = sd["last_triggered"] or "Never",
+            last_restored    = sd["last_restored"] or "—",
+            last_restored_disp  = sd["last_restored"] or "Never",
+            activity_items   = items,
+        )
+        self._html(html)
+
+    # -- webhook handler ----------------------------------------------------
+
+    def _handle_webhook(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        log.debug("Webhook raw (%d bytes): %s", len(raw), raw[:500])
+
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            log.warning("Invalid JSON: %s", exc)
-            self._respond(400, {"error": "Invalid JSON"})
+            data = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning("Bad webhook payload: %s", exc)
+            self._json(400, {"error": "invalid JSON"})
             return
 
-        log.debug("Webhook payload: %s", json.dumps(data, indent=2))
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                pass
 
-        # Look for the configured trigger key in alarm.triggers[].key
+        if not isinstance(data, dict):
+            self._json(400, {"error": "expected JSON object"})
+            return
+
+        log.debug("Webhook parsed: %s", json.dumps(data))
+
+        alarm    = data.get("alarm") or data.get("Alarm") or {}
         triggers = []
-        alarm = data.get("alarm") or data.get("Alarm") or {}
         if isinstance(alarm, dict):
             triggers = alarm.get("triggers") or alarm.get("Triggers") or []
 
         matched = any(
-            t.get("key") == self.config.trigger_key or t.get("Key") == self.config.trigger_key
-            for t in triggers
-            if isinstance(t, dict)
+            t.get("key") == self.config.trigger_key or
+            t.get("Key") == self.config.trigger_key
+            for t in triggers if isinstance(t, dict)
         )
 
         if matched:
-            log.info("Trigger matched: key=%s", self.config.trigger_key)
+            log.info("Webhook trigger matched: key=%s", self.config.trigger_key)
             threading.Thread(target=self.alarm_sm.trigger, daemon=True).start()
-            self._respond(200, {"triggered": True})
+            self._json(200, {"triggered": True})
         else:
-            log.debug("No matching trigger key '%s' in payload", self.config.trigger_key)
-            self._respond(200, {"triggered": False})
+            log.debug("Webhook: trigger key '%s' not matched", self.config.trigger_key)
+            self._json(200, {"triggered": False})
 
-    def _respond(self, code: int, obj: dict):
-        body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    # -- test handler -------------------------------------------------------
 
-    def log_message(self, format, *args):
-        """Route BaseHTTPRequestHandler logs through our logger."""
-        log.info(format, *args)
+    def _handle_test(self):
+        log.info("Test trigger from UI")
+        threading.Thread(target=self.alarm_sm.trigger, daemon=True).start()
+        self._json(200, {"triggered": True})
 
 
 # ---------------------------------------------------------------------------
@@ -447,32 +700,35 @@ def main():
 
     logging.basicConfig(
         level=getattr(logging, config.log_level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
     )
 
     log.info("Starting UniFi Protect → Trimlight alarm service")
-    log.info("  API URL        : %s", config.api_url)
-    log.info("  Device ID      : %s", config.device_id)
-    log.info("  Webhook port   : %d", config.webhook_port)
-    log.info("  Alarm timeout  : %ds", config.alarm_timeout)
-    log.info("  Trigger key    : %s", config.trigger_key)
+    log.info("  API URL       : %s", config.api_url)
+    log.info("  Device ID     : %s", config.device_id)
+    log.info("  Port          : %d", config.webhook_port)
+    log.info("  Alarm timeout : %ds", config.alarm_timeout)
+    log.info("  Trigger key   : %s", config.trigger_key)
 
     alarm_sm = AlarmStateMachine(config)
 
     WebhookHandler.alarm_sm = alarm_sm
-    WebhookHandler.config = config
+    WebhookHandler.config   = config
 
     server = HTTPServer(("0.0.0.0", config.webhook_port), WebhookHandler)
 
-    def _shutdown(signum, frame):
-        log.info("Received signal %d — shutting down", signum)
+    def _shutdown(sig, _frame):
+        log.info("Received signal %d — shutting down", sig)
         threading.Thread(target=server.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
     log.info("Listening on 0.0.0.0:%d", config.webhook_port)
+    log.info("Status page → http://0.0.0.0:%d/", config.webhook_port)
+    log.info("Webhook URL → http://0.0.0.0:%d/webhook", config.webhook_port)
     server.serve_forever()
     log.info("Server stopped")
 
