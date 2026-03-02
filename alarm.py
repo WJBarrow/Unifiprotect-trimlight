@@ -40,7 +40,7 @@ log = logging.getLogger("alarm")
 EFFECTS = {
     "white":      {"label": "Solid White",  "color": 0xFFFFFF, "mode": 0,  "speed": 100, "brightness": 255},
     "red":        {"label": "Solid Red",    "color": 0xFF0000, "mode": 0,  "speed": 100, "brightness": 255},
-    "red-strobe": {"label": "Red Strobe",   "color": 0xFF0000, "mode": 15, "speed": 150, "brightness": 180},
+    "red-strobe": {"label": "Red Strobe",   "color": 0xFF0000, "mode": 15, "speed": 150, "brightness": 255},
     "blue":       {"label": "Solid Blue",   "color": 0x0000FF, "mode": 0,  "speed": 100, "brightness": 255},
     "amber":      {"label": "Solid Amber",  "color": 0xFF8C00, "mode": 0,  "speed": 100, "brightness": 255},
 }
@@ -646,8 +646,7 @@ _HTML = """\
     }}
 
     const state = '{state_class}';
-    if (state !== 'idle') setTimeout(() => location.reload(), 10000);
-    else setTimeout(() => location.reload(), 30000);
+    if (state !== 'idle') setTimeout(() => location.reload(), 5000);
   </script>
 </body>
 </html>
