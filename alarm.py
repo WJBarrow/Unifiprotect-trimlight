@@ -222,7 +222,7 @@ class AlarmStateMachine:
     def __init__(self, config: Config):
         self.config              = config
         self._state              = self.IDLE
-        self._lock               = threading.Lock()
+        self._lock               = threading.RLock()
         self._timer              = None
         self._current_effect     = None   # effect name active during alarm
         self._saved_switch_state = None
