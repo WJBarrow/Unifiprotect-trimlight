@@ -695,7 +695,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/", "/status"):
             self._serve_ui()
-        elif path == "/health":
+        elif path in ("/health", "/webhook"):
             self._json(200, {"status": "ok", **self.alarm_sm.get_state_dict()})
         else:
             self._json(404, {"error": "not found"})
