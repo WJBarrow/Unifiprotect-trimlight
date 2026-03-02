@@ -34,15 +34,34 @@ log = logging.getLogger("alarm")
 
 # ---------------------------------------------------------------------------
 # Named light effects
-# Each entry: label, color (RGB int), mode (Trimlight custom mode), speed, brightness
+# Each entry: label, pixels (list of Trimlight pixel segments), mode, speed, brightness
 # Custom effect modes: 0=Static 1=Chase Fwd 2=Chase Bwd 5=Stars 6=Breath 15=Strobe 16=Fade
+# pixels: [{"index": N, "count": N, "color": 0xRRGGBB, "disable": bool}, ...]
+#   index = segment slot (0–29), count = consecutive LEDs in that segment,
+#   the pattern tiles repeatedly across all LEDs on the controller.
 # ---------------------------------------------------------------------------
+def _px(*rgb_pairs):
+    """Build a pixel list from (color, count) pairs."""
+    return [{"index": i, "count": c, "color": col, "disable": False}
+            for i, (col, c) in enumerate(rgb_pairs)]
+
 EFFECTS = {
-    "white":      {"label": "Solid White",  "color": 0xFFFFFF, "mode": 0,  "speed": 100, "brightness": 255},
-    "red":        {"label": "Solid Red",    "color": 0xFF0000, "mode": 0,  "speed": 100, "brightness": 255},
-    "red-strobe": {"label": "Red Strobe",   "color": 0xFF0000, "mode": 15, "speed": 150, "brightness": 255},
-    "blue":       {"label": "Solid Blue",   "color": 0x0000FF, "mode": 0,  "speed": 100, "brightness": 255},
-    "amber":      {"label": "Solid Amber",  "color": 0xFF8C00, "mode": 0,  "speed": 100, "brightness": 255},
+    "white":          {"label": "Solid White",     "mode": 0,  "speed": 100, "brightness": 255,
+                       "pixels": _px((0xFFFFFF, 1))},
+    "red":            {"label": "Solid Red",       "mode": 0,  "speed": 100, "brightness": 255,
+                       "pixels": _px((0xFF0000, 1))},
+    "red-strobe":     {"label": "Red Strobe",      "mode": 15, "speed": 150, "brightness": 255,
+                       "pixels": _px((0xFF0000, 1))},
+    "blue":           {"label": "Solid Blue",      "mode": 0,  "speed": 100, "brightness": 255,
+                       "pixels": _px((0x0000FF, 1))},
+    "amber":          {"label": "Solid Amber",     "mode": 0,  "speed": 100, "brightness": 255,
+                       "pixels": _px((0xFF8C00, 1))},
+    # All LEDs flash red then all flash blue (strobe cycles through both color segments)
+    "red-blue-strobe": {"label": "Red Blue Strobe", "mode": 15, "speed": 200, "brightness": 255,
+                        "pixels": _px((0xFF0000, 1), (0x0000FF, 1))},
+    # Alternating red/blue LEDs chase forward (each LED swaps color each cycle)
+    "red-blue-chase":  {"label": "Red Blue Chase",  "mode": 1,  "speed": 150, "brightness": 255,
+                        "pixels": _px((0xFF0000, 1), (0x0000FF, 1))},
 }
 DEFAULT_EFFECT = "white"
 
@@ -187,9 +206,7 @@ class TrimlightClient:
                 "mode":       effect["mode"],
                 "speed":      effect["speed"],
                 "brightness": effect["brightness"],
-                "pixels": [
-                    {"index": 0, "count": 1, "color": effect["color"], "disable": False},
-                ],
+                "pixels": effect["pixels"],
             },
         })
 
@@ -735,10 +752,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return {0: "Static", 1: "Chase Fwd", 2: "Chase Bwd",
                     6: "Breath", 15: "Strobe", 16: "Fade"}.get(m, str(m))
 
+        def swatches(effect):
+            return "".join(
+                f'<span class="swatch" style="background:#{p["color"]:06X}"></span>'
+                for p in effect["pixels"] if not p.get("disable", False)
+            )
+
         fx_rows = "\n        ".join(
             f'<tr>'
-            f'<td><span class="swatch" style="background:#{v["color"]:06X}"></span>'
-            f'<span class="fx-name">{k}</span></td>'
+            f'<td>{swatches(v)}<span class="fx-name">{k}</span></td>'
             f'<td>{v["label"]}</td>'
             f'<td>{mode_label(v["mode"])}</td>'
             f'<td>{v["speed"]}</td>'
