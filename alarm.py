@@ -179,7 +179,7 @@ class TrimlightClient:
         self._post("/v1/oauth/resources/device/effect/preview", {
             "deviceId": self.config.device_id,
             "payload": {
-                "category": 1,
+                "category": 2,  # Edge uses category 2 for custom effects (docs say 1, device expects 2)
                 "mode": mode,
                 "speed": speed,
                 "brightness": brightness,
@@ -219,7 +219,7 @@ class TrimlightClient:
         """Set all lights to solid red."""
         self.set_switch_state(SWITCH_MANUAL)
         self.preview_custom_effect(
-            pixels=[{"index": 0, "count": 60, "color": COLOR_RED, "disable": False}],
+            pixels=[{"index": 0, "count": 1, "color": COLOR_RED, "disable": False}],
             mode=0,       # STATIC
             speed=100,
             brightness=255,
