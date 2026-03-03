@@ -62,6 +62,14 @@ EFFECTS = {
     # Alternating red/blue LEDs chase forward
     "red-blue-chase":  {"label": "Red Blue Chase",  "mode": 1,  "speed": 150, "brightness": 255,
                         "pixels": _px((0xFF0000, 1), (0x0000FF, 1))},
+    # Invoke a pattern saved on the Trimlight device by name
+    "intruder": {
+        "label":      "Intruder Red Blue Strobe",
+        "saved_name": "IntruderRedBlueStrobe",   # exact name as saved on the device
+        # UI display only — actual appearance is defined on the device
+        "mode": 15, "speed": 200, "brightness": 255,
+        "pixels": _px((0xFF0000, 1), (0x0000FF, 1)),
+    },
     # All LEDs switch from solid red → solid blue → solid red … (cycle effect)
     "police": {
         "label":    "Police Flash",
@@ -230,6 +238,18 @@ class TrimlightClient:
             "payload":  {"id": effect_id},
         })
 
+    def find_saved_effect_id(self, name: str, effects: list) -> int:
+        """Return the ID of a saved effect matched by name (case-insensitive).
+        Raises APIError if not found."""
+        name_lower = name.lower()
+        for eff in effects:
+            if isinstance(eff, dict) and eff.get("name", "").lower() == name_lower:
+                return eff["id"]
+        raise APIError(
+            f"Saved effect '{name}' not found on device. "
+            f"Available: {[e.get('name') for e in effects if isinstance(e, dict)]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Alarm state machine
@@ -351,7 +371,11 @@ class AlarmStateMachine:
 
         client.set_switch_state(SWITCH_MANUAL)
         effect = EFFECTS[effect_name]
-        if "frames" in effect:
+        if "saved_name" in effect:
+            saved_id = client.find_saved_effect_id(effect["saved_name"],
+                                                   detail.get("effects", []))
+            client.view_effect(saved_id)
+        elif "frames" in effect:
             threading.Thread(
                 target=self._run_cycle_effect,
                 args=(effect_name,), daemon=True,
@@ -381,13 +405,18 @@ class AlarmStateMachine:
         """Apply a new effect while already in Manual mode, then reset timer."""
         try:
             effect = EFFECTS[effect_name]
-            if "frames" in effect:
+            client = TrimlightClient(self.config)
+            if "saved_name" in effect:
+                detail = client.get_device_detail()
+                saved_id = client.find_saved_effect_id(effect["saved_name"],
+                                                       detail.get("effects", []))
+                client.view_effect(saved_id)
+            elif "frames" in effect:
                 threading.Thread(
                     target=self._run_cycle_effect,
                     args=(effect_name,), daemon=True,
                 ).start()
             else:
-                client = TrimlightClient(self.config)
                 client.preview_effect(effect)
         except Exception as exc:
             self._log(f"Override apply failed: {exc}", level="error")
@@ -807,11 +836,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
             )
 
         def effect_mode_cell(v):
+            if "saved_name" in v:
+                return f'Saved: {v["saved_name"]}'
             if "frames" in v:
                 return f'Cycle &times; {len(v["frames"])} frames'
             return mode_label(v["mode"])
 
         def effect_speed_cell(v):
+            if "saved_name" in v:
+                return "&mdash;"
             if "frames" in v:
                 return f'{v["interval"]}s / frame'
             return str(v["speed"])
