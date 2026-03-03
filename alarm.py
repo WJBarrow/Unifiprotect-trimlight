@@ -56,12 +56,24 @@ EFFECTS = {
                        "pixels": _px((0x0000FF, 1))},
     "amber":          {"label": "Solid Amber",     "mode": 0,  "speed": 100, "brightness": 255,
                        "pixels": _px((0xFF8C00, 1))},
-    # All LEDs flash red then all flash blue (strobe cycles through both color segments)
+    # Alternating red/blue LED pattern strobes on/off together
     "red-blue-strobe": {"label": "Red Blue Strobe", "mode": 15, "speed": 200, "brightness": 255,
                         "pixels": _px((0xFF0000, 1), (0x0000FF, 1))},
-    # Alternating red/blue LEDs chase forward (each LED swaps color each cycle)
+    # Alternating red/blue LEDs chase forward
     "red-blue-chase":  {"label": "Red Blue Chase",  "mode": 1,  "speed": 150, "brightness": 255,
                         "pixels": _px((0xFF0000, 1), (0x0000FF, 1))},
+    # All LEDs switch from solid red → solid blue → solid red … (cycle effect)
+    "police": {
+        "label":    "Police Flash",
+        "frames": [
+            {"label": "Police Flash – red",  "mode": 0, "speed": 100, "brightness": 255, "pixels": _px((0xFF0000, 1))},
+            {"label": "Police Flash – blue", "mode": 0, "speed": 100, "brightness": 255, "pixels": _px((0x0000FF, 1))},
+        ],
+        "interval": 0.75,   # seconds each frame is shown before switching
+        # UI display fields (first-frame colour shown as primary swatch)
+        "mode": 0, "speed": 100, "brightness": 255,
+        "pixels": _px((0xFF0000, 1), (0x0000FF, 1)),
+    },
 }
 DEFAULT_EFFECT = "white"
 
@@ -338,13 +350,45 @@ class AlarmStateMachine:
                  self._saved_switch_state, self._saved_effect_id)
 
         client.set_switch_state(SWITCH_MANUAL)
-        client.preview_effect(EFFECTS[effect_name])
+        effect = EFFECTS[effect_name]
+        if "frames" in effect:
+            threading.Thread(
+                target=self._run_cycle_effect,
+                args=(effect_name,), daemon=True,
+            ).start()
+        else:
+            client.preview_effect(effect)
+
+    def _run_cycle_effect(self, effect_name: str):
+        """Loop through cycle-effect frames while this effect is active."""
+        effect   = EFFECTS[effect_name]
+        frames   = effect["frames"]
+        interval = effect.get("interval", 1.0)
+        client   = TrimlightClient(self.config)
+        i        = 0
+        while True:
+            with self._lock:
+                if self._state != self.ALARMED or self._current_effect != effect_name:
+                    break
+            try:
+                client.preview_effect(frames[i % len(frames)])
+            except APIError as exc:
+                log.warning("Cycle frame preview failed: %s", exc)
+            i += 1
+            time.sleep(interval)
 
     def _apply_effect_and_reset_timer(self, effect_name: str):
         """Apply a new effect while already in Manual mode, then reset timer."""
         try:
-            client = TrimlightClient(self.config)
-            client.preview_effect(EFFECTS[effect_name])
+            effect = EFFECTS[effect_name]
+            if "frames" in effect:
+                threading.Thread(
+                    target=self._run_cycle_effect,
+                    args=(effect_name,), daemon=True,
+                ).start()
+            else:
+                client = TrimlightClient(self.config)
+                client.preview_effect(effect)
         except Exception as exc:
             self._log(f"Override apply failed: {exc}", level="error")
         with self._lock:
@@ -753,17 +797,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     6: "Breath", 15: "Strobe", 16: "Fade"}.get(m, str(m))
 
         def swatches(effect):
+            if "frames" in effect:
+                colors = [f["pixels"][0]["color"] for f in effect["frames"]]
+            else:
+                colors = [p["color"] for p in effect["pixels"] if not p.get("disable", False)]
             return "".join(
-                f'<span class="swatch" style="background:#{p["color"]:06X}"></span>'
-                for p in effect["pixels"] if not p.get("disable", False)
+                f'<span class="swatch" style="background:#{c:06X}"></span>'
+                for c in colors
             )
+
+        def effect_mode_cell(v):
+            if "frames" in v:
+                return f'Cycle &times; {len(v["frames"])} frames'
+            return mode_label(v["mode"])
+
+        def effect_speed_cell(v):
+            if "frames" in v:
+                return f'{v["interval"]}s / frame'
+            return str(v["speed"])
 
         fx_rows = "\n        ".join(
             f'<tr>'
             f'<td>{swatches(v)}<span class="fx-name">{k}</span></td>'
             f'<td>{v["label"]}</td>'
-            f'<td>{mode_label(v["mode"])}</td>'
-            f'<td>{v["speed"]}</td>'
+            f'<td>{effect_mode_cell(v)}</td>'
+            f'<td>{effect_speed_cell(v)}</td>'
             f'<td>{v["brightness"]}</td>'
             f'</tr>'
             for k, v in EFFECTS.items()
