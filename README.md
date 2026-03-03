@@ -35,7 +35,6 @@ All configuration is via environment variables (set in `.env`):
 1. Contact Trimlight to obtain a `clientId` and `clientSecret`
 2. Find your `deviceId` via the device list API:
    ```bash
-   # timestamp in milliseconds
    TS=$(date +%s000)
    SIG=$(echo -n "Trimlight|<clientId>|$TS" | openssl dgst -sha256 -hmac "<clientSecret>" -binary | base64)
    curl -X POST https://trimlight.ledhue.com/trimlight/v1/oauth/resources/devices \
@@ -48,22 +47,51 @@ All configuration is via environment variables (set in `.env`):
 
 ## Available Effects
 
-| Name | Description |
-|------|-------------|
-| `white` | Solid white — full brightness |
-| `red` | Solid red — full brightness |
-| `red-strobe` | Red strobe — full brightness |
-| `blue` | Solid blue — full brightness |
-| `amber` | Solid amber — full brightness |
+The effect to apply is specified as a URL parameter on the webhook: `POST /webhook?effect=<name>`
+
+### Built-in Effects
+
+| Name | Type | Description |
+|------|------|-------------|
+| `white` | Static | Solid white — full brightness |
+| `red` | Static | Solid red — full brightness |
+| `red-strobe` | Strobe | Red strobe — full brightness |
+| `blue` | Static | Solid blue — full brightness |
+| `amber` | Static | Solid amber — full brightness |
+| `red-blue-strobe` | Strobe | Alternating red/blue LED pattern strobing together |
+| `red-blue-chase` | Chase | Alternating red/blue LEDs chasing forward |
+| `police` | Cycle | All LEDs solid red → all LEDs solid blue, alternating every ~1s |
+| `intruder` | Saved | Invokes the `IntruderRedBlueStrobe` pattern saved on the device |
+
+### Saved Device Effects
+
+Effects of type **Saved** invoke a pattern you have already created and saved in the Trimlight app. The effect is looked up by name at trigger time — no pixel data is sent from this service. If the name is not found, the error log lists all available effect names on the device.
+
+To add more saved effects, add an entry to the `EFFECTS` dict in `alarm.py`:
+
+```python
+"my-effect": {
+    "label":      "My Custom Effect",
+    "saved_name": "ExactNameInTrimlightApp",  # case-insensitive match
+    # UI display only:
+    "mode": 0, "speed": 127, "brightness": 255,
+    "pixels": _px((0xFF0000, 1)),
+},
+```
+
+### Cycle Effects
+
+Effects of type **Cycle** loop through a list of frames in a background thread while the alarm is active, sending each frame as a `preview_effect` API call. The minimum cycle time is bounded by the Trimlight cloud API round-trip (~1s per call).
 
 ## UniFi Protect Setup
 
-In Protect → Alarm Manager, create one alarm per detection type and set its webhook to a POST with the corresponding URL:
+In Protect → Alarm Manager, create one alarm per detection type and configure its webhook as a POST to the corresponding URL:
 
 | Detection type | Webhook URL |
 |----------------|-------------|
 | Animal / Person | `http://<host>:8484/webhook?effect=white` |
 | Vehicle | `http://<host>:8484/webhook?effect=red-strobe` |
+| Intruder | `http://<host>:8484/webhook?effect=intruder` |
 
 For each alarm:
 1. Add a **Webhook** notification action
@@ -78,8 +106,9 @@ If no `?effect=` parameter is given the default effect (`white`) is used.
 |--------|------|-------------|
 | `GET` | `/` | Status web UI |
 | `GET` | `/health` | JSON health check |
+| `GET` | `/webhook` | Connectivity probe (returns 200 — UniFi Protect checks this before sending alarms) |
 | `POST` | `/webhook?effect=<name>` | UniFi Protect webhook receiver |
-| `POST` | `/test` | Trigger a test alarm (used by the UI) |
+| `POST` | `/test` | Trigger a test alarm (used by the web UI) |
 
 ## Alarm Behaviour
 
@@ -90,13 +119,15 @@ IDLE ──trigger(effect)──▸ ALARMED ──timeout──▸ RESTORING ─
                    new effect:  override immediately + reset timer
 ```
 
-1. **Trigger** — Saves current device state (switch mode + effect ID), switches to Manual, previews the named effect
-2. **Debounce** — Re-trigger with the same effect resets the countdown without re-sending the command
+1. **Trigger** — Saves current device state (switch mode + effect ID), switches to Manual, applies the named effect
+2. **Debounce** — Re-trigger with the same effect resets the countdown without re-applying the effect
 3. **Override** — Re-trigger with a different effect applies the new effect immediately and resets the countdown
 4. **Restore** — Switches back to the saved state:
-   - *Timer mode* → Off → Timer (clears preview buffer, resumes schedule)
+   - *Timer mode* → Off → Timer (clears preview buffer so schedule resumes cleanly)
    - *Manual mode* → re-activates the previously running saved effect
    - *Off* → turns lights back off
+
+The page auto-refreshes every 5 seconds only while an alarm is active.
 
 ## How It Works
 
@@ -107,14 +138,14 @@ Authentication uses HMAC-SHA256:
 
 API endpoints used:
 - **Notify Update Shadow** — request fresh device state from controller
-- **Device Detail** — query current switch mode and running effect
+- **Device Detail** — query current switch mode, running effect, and saved effects list
 - **Set Switch State** — switch between Off (0), Manual (1), Timer (2)
-- **Preview Custom Effect** — apply a named light effect (category 2 for Edge firmware)
-- **View Effect** — restore a saved effect by ID
+- **Preview Custom Effect** — apply a custom light effect (Edge firmware requires `category: 2`)
+- **View Effect** — activate a saved effect by ID (used for saved-name effects and restore)
 
 ## Testing
 
-**Simulate a detection from the command line:**
+**Simulate detections from the command line:**
 ```bash
 curl -X POST "http://localhost:8484/webhook?effect=white" \
   -H "Content-Type: application/json" \
@@ -123,6 +154,10 @@ curl -X POST "http://localhost:8484/webhook?effect=white" \
 curl -X POST "http://localhost:8484/webhook?effect=red-strobe" \
   -H "Content-Type: application/json" \
   -d '{"alarm":{"triggers":[{"key":"vehicle","device":"camera1"}]}}'
+
+curl -X POST "http://localhost:8484/webhook?effect=intruder" \
+  -H "Content-Type: application/json" \
+  -d '{"alarm":{"triggers":[{"key":"person","device":"camera1"}]}}'
 ```
 
 **Health check:**
