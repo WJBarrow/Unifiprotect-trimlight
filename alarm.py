@@ -69,7 +69,7 @@ EFFECTS = {
             {"label": "Police Flash – red",  "mode": 0, "speed": 100, "brightness": 255, "pixels": _px((0xFF0000, 1))},
             {"label": "Police Flash – blue", "mode": 0, "speed": 100, "brightness": 255, "pixels": _px((0x0000FF, 1))},
         ],
-        "interval": 0.75,   # seconds each frame is shown before switching
+        "interval": 0.1,    # seconds each frame is shown before switching (API latency ~1s dominates)
         # UI display fields (first-frame colour shown as primary swatch)
         "mode": 0, "speed": 100, "brightness": 255,
         "pixels": _px((0xFF0000, 1), (0x0000FF, 1)),
