@@ -372,9 +372,12 @@ class AlarmStateMachine:
         client.set_switch_state(SWITCH_MANUAL)
         effect = EFFECTS[effect_name]
         if "saved_name" in effect:
-            saved_id = client.find_saved_effect_id(effect["saved_name"],
-                                                   detail.get("effects", []))
-            client.view_effect(saved_id)
+            # preview_effect works reliably in Manual mode regardless of prior
+            # switch state.  view_effect is designed for Timer mode and returns
+            # API success after an Off→Manual transition but the device never
+            # visually applies the effect.
+            log.info("Invoking saved effect '%s' via preview_effect", effect["saved_name"])
+            client.preview_effect(effect)
         elif "frames" in effect:
             threading.Thread(
                 target=self._run_cycle_effect,
@@ -407,10 +410,8 @@ class AlarmStateMachine:
             effect = EFFECTS[effect_name]
             client = TrimlightClient(self.config)
             if "saved_name" in effect:
-                detail = client.get_device_detail()
-                saved_id = client.find_saved_effect_id(effect["saved_name"],
-                                                       detail.get("effects", []))
-                client.view_effect(saved_id)
+                log.info("Invoking saved effect '%s' via preview_effect", effect["saved_name"])
+                client.preview_effect(effect)
             elif "frames" in effect:
                 threading.Thread(
                     target=self._run_cycle_effect,
