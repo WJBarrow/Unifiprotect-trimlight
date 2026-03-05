@@ -65,7 +65,9 @@ The effect to apply is specified as a URL parameter on the webhook: `POST /webho
 
 ### Saved Device Effects
 
-Effects of type **Saved** invoke a pattern you have already created and saved in the Trimlight app. The pixel/mode/speed/brightness values in the `EFFECTS` dict serve as an approximation for the UI display and are what is sent to the device via `preview_effect` at alarm time — `preview_effect` works reliably regardless of the device's prior switch state (Off, Manual, or Timer), unlike `view_effect` which is only reliable while the device is already in Timer mode. If the saved effect name is not found on the device, the error log lists all available names.
+Effects of type **Saved** invoke a pattern you have already created and saved in the Trimlight app. The effect is looked up by name at trigger time using `view_effect`. The pixel/mode/speed/brightness values in the `EFFECTS` dict are used only for the UI swatch display.
+
+`view_effect` requires the device to be in Timer mode to activate reliably. If the device is in Off or Manual mode when the alarm fires, the service briefly switches it to Timer first (you may see a ~1s flash of the scheduled program), then activates the saved effect, then locks it in Manual for the duration of the alarm. If the saved effect name is not found on the device, the error log lists all available effect names.
 
 To add more saved effects, add an entry to the `EFFECTS` dict in `alarm.py`:
 

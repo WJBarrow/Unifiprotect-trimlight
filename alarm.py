@@ -369,21 +369,26 @@ class AlarmStateMachine:
         log.info("Saved state: switchState=%s effectId=%s",
                  self._saved_switch_state, self._saved_effect_id)
 
-        client.set_switch_state(SWITCH_MANUAL)
         effect = EFFECTS[effect_name]
         if "saved_name" in effect:
-            # preview_effect works reliably in Manual mode regardless of prior
-            # switch state.  view_effect is designed for Timer mode and returns
-            # API success after an Off→Manual transition but the device never
-            # visually applies the effect.
-            log.info("Invoking saved effect '%s' via preview_effect", effect["saved_name"])
-            client.preview_effect(effect)
+            saved_id = client.find_saved_effect_id(effect["saved_name"],
+                                                   detail.get("effects", []))
+            # view_effect only activates reliably when the device is in Timer mode.
+            # Ensure Timer mode first, then activate the saved effect, then lock
+            # in Manual so the schedule doesn't advance past it.
+            if self._saved_switch_state != SWITCH_TIMER:
+                client.set_switch_state(SWITCH_TIMER)
+                time.sleep(1.0)
+            client.view_effect(saved_id)
+            client.set_switch_state(SWITCH_MANUAL)
         elif "frames" in effect:
+            client.set_switch_state(SWITCH_MANUAL)
             threading.Thread(
                 target=self._run_cycle_effect,
                 args=(effect_name,), daemon=True,
             ).start()
         else:
+            client.set_switch_state(SWITCH_MANUAL)
             client.preview_effect(effect)
 
     def _run_cycle_effect(self, effect_name: str):
@@ -410,8 +415,15 @@ class AlarmStateMachine:
             effect = EFFECTS[effect_name]
             client = TrimlightClient(self.config)
             if "saved_name" in effect:
-                log.info("Invoking saved effect '%s' via preview_effect", effect["saved_name"])
-                client.preview_effect(effect)
+                detail = client.get_device_detail()
+                saved_id = client.find_saved_effect_id(effect["saved_name"],
+                                                       detail.get("effects", []))
+                current_state = detail.get("switchState")
+                if current_state != SWITCH_TIMER:
+                    client.set_switch_state(SWITCH_TIMER)
+                    time.sleep(1.0)
+                client.view_effect(saved_id)
+                client.set_switch_state(SWITCH_MANUAL)
             elif "frames" in effect:
                 threading.Thread(
                     target=self._run_cycle_effect,
