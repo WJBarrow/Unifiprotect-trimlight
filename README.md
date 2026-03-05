@@ -124,8 +124,8 @@ IDLE ──trigger(effect)──▸ ALARMED ──timeout──▸ RESTORING ─
 3. **Override** — Re-trigger with a different effect applies the new effect immediately and resets the countdown
 4. **Restore** — Switches back to the saved state:
    - *Timer mode* → Off → Timer (clears preview buffer so schedule resumes cleanly)
-   - *Manual mode* → re-activates the previously running saved effect
-   - *Off* → turns lights back off
+   - *Manual mode with saved effect* → re-activates the previously running saved effect
+   - *Off or unknown* → Off → Timer (treated same as Timer; prevents a cascade where repeated alarms permanently lock lights off)
 
 The page auto-refreshes every 5 seconds only while an alarm is active.
 

@@ -431,27 +431,34 @@ class AlarmStateMachine:
                 return
             self._state = self.RESTORING
 
+        # Wait for any in-flight cycle-effect API call to complete before
+        # sending restore commands — prevents a race where the last
+        # preview_effect arrives after SWITCH_TIMER and reverts the device
+        # back to Manual mode.
+        time.sleep(1.5)
+
         self._log("Restoring previous state…")
         try:
             client = TrimlightClient(self.config)
             saved  = self._saved_switch_state
 
-            if saved == SWITCH_TIMER:
-                self._log("Restoring Timer mode (schedule will resume)")
-                client.set_switch_state(SWITCH_OFF)
-                time.sleep(0.5)
-                client.set_switch_state(SWITCH_TIMER)
-
-            elif saved == SWITCH_MANUAL and self._saved_effect_id is not None:
+            if saved == SWITCH_MANUAL and self._saved_effect_id is not None:
                 self._log(f"Restoring Manual effect ID {self._saved_effect_id}")
                 client.view_effect(self._saved_effect_id)
 
-            elif saved == SWITCH_OFF:
-                self._log("Restoring Off state")
-                client.set_switch_state(SWITCH_OFF)
-
             else:
-                self._log("Previous state unknown — defaulting to Timer", level="warning")
+                # Restore to Timer for both SWITCH_TIMER and SWITCH_OFF.
+                # When saved==SWITCH_OFF the device was likely off because no
+                # schedule was active at that moment — not because the user
+                # explicitly turned it off.  Always returning to Timer lets the
+                # schedule resume naturally and prevents the cascade where every
+                # successive alarm finds switchState=0 and permanently locks the
+                # lights off.
+                if saved == SWITCH_OFF:
+                    self._log("Saved state was Off — restoring to Timer so schedule can resume",
+                              level="warning")
+                else:
+                    self._log("Restoring Timer mode (schedule will resume)")
                 client.set_switch_state(SWITCH_OFF)
                 time.sleep(0.5)
                 client.set_switch_state(SWITCH_TIMER)
