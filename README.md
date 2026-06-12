@@ -67,7 +67,7 @@ The effect to apply is specified as a URL parameter on the webhook: `POST /webho
 
 Effects of type **Saved** invoke a pattern you have already created and saved in the Trimlight app. The effect is looked up by name at trigger time using `view_effect`. The pixel/mode/speed/brightness values in the `EFFECTS` dict are used only for the UI swatch display.
 
-`view_effect` requires the device to be in Timer mode to activate reliably. If the device is in Off or Manual mode when the alarm fires, the service briefly switches it to Timer first (you may see a ~1s flash of the scheduled program), then activates the saved effect, then locks it in Manual for the duration of the alarm. If the saved effect name is not found on the device, the error log lists all available effect names.
+`view_effect` requires the device to be in Timer mode to activate reliably. If the device is not already in Timer mode when the alarm fires, the service briefly switches it to Timer first, then activates the saved effect, then locks it in Manual for the duration of the alarm. If the saved effect name is not found on the device, the error log lists all available effect names.
 
 To add more saved effects, add an entry to the `EFFECTS` dict in `alarm.py`:
 
@@ -121,7 +121,7 @@ IDLE ──trigger(effect)──▸ ALARMED ──timeout──▸ RESTORING ─
                    new effect:  override immediately + reset timer
 ```
 
-1. **Trigger** — Saves current device state (switch mode + effect ID), switches to Manual, applies the named effect
+1. **Trigger** — Saves current device state (switch mode + effect ID), then applies the alarm effect. When the device is in Timer+idle mode (schedule has ended, LEDs are physically off), the Trimlight firmware silently drops effect commands. The service works around this by sending two-way `get_device_detail` round-trips before `preview_effect` to nudge the device into a responsive state, then verifies that the command was accepted by checking the resulting switch state. If not confirmed, it retries up to 5 times automatically (typically 1–2 attempts are sufficient)
 2. **Debounce** — Re-trigger with the same effect resets the countdown without re-applying the effect
 3. **Override** — Re-trigger with a different effect applies the new effect immediately and resets the countdown
 4. **Restore** — Switches back to the saved state:
@@ -139,10 +139,9 @@ Authentication uses HMAC-SHA256:
 3. Base64-encode → `authorization` header
 
 API endpoints used:
-- **Notify Update Shadow** — request fresh device state from controller
-- **Device Detail** — query current switch mode, running effect, and saved effects list
+- **Device Detail** — query current switch mode, running effect, and saved effects list. Also doubles as a two-way wake ping before applying effects when the device is in Timer+idle
 - **Set Switch State** — switch between Off (0), Manual (1), Timer (2)
-- **Preview Custom Effect** — apply a custom light effect (Edge firmware requires `category: 2`)
+- **Preview Custom Effect** — apply a custom light effect (Edge firmware requires `category: 2`). Atomically transitions the device to Manual mode and applies the effect; used with retry+verify for static effects
 - **View Effect** — activate a saved effect by ID (used for saved-name effects and restore)
 
 ## Testing

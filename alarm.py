@@ -355,12 +355,6 @@ class AlarmStateMachine:
     def _activate_alarm(self, effect_name: str):
         """Save device state, switch to Manual, apply effect."""
         client = TrimlightClient(self.config)
-        try:
-            client.notify_update_shadow()
-            time.sleep(1)
-        except Exception:
-            log.debug("notify_update_shadow failed (non-fatal)")
-
         detail = client.get_device_detail()
         self._saved_switch_state = detail.get("switchState")
         current = detail.get("currentEffect") or {}
@@ -369,27 +363,46 @@ class AlarmStateMachine:
         log.info("Saved state: switchState=%s effectId=%s",
                  self._saved_switch_state, self._saved_effect_id)
 
+        # When the device is in Timer+idle (no active schedule), effect commands
+        # are silently dropped until the device becomes responsive. Retry with
+        # verification: each get_device_detail round-trip also acts as a ping
+        # that nudges the device toward a responsive state. preview_effect
+        # atomically applies the effect and transitions to Manual mode, so
+        # switchState=1 in the check confirms the command was actually received.
         effect = EFFECTS[effect_name]
         if "saved_name" in effect:
             saved_id = client.find_saved_effect_id(effect["saved_name"],
                                                    detail.get("effects", []))
-            # view_effect only activates reliably when the device is in Timer mode.
-            # Ensure Timer mode first, then activate the saved effect, then lock
-            # in Manual so the schedule doesn't advance past it.
             if self._saved_switch_state != SWITCH_TIMER:
                 client.set_switch_state(SWITCH_TIMER)
-                time.sleep(1.0)
+                time.sleep(0.5)
             client.view_effect(saved_id)
             client.set_switch_state(SWITCH_MANUAL)
         elif "frames" in effect:
-            client.set_switch_state(SWITCH_MANUAL)
             threading.Thread(
                 target=self._run_cycle_effect,
                 args=(effect_name,), daemon=True,
             ).start()
         else:
-            client.set_switch_state(SWITCH_MANUAL)
-            client.preview_effect(effect)
+            # Reproduce the exact sequence from the diagnostic run that
+            # successfully woke the device: Off → ping → Manual → ping →
+            # preview_effect. Wrap in a retry loop so transient unresponsiveness
+            # is retried automatically.
+            for attempt in range(5):
+                client.set_switch_state(SWITCH_OFF)
+                time.sleep(0.2)
+                client.get_device_detail()
+                client.set_switch_state(SWITCH_MANUAL)
+                time.sleep(0.2)
+                client.get_device_detail()
+                client.preview_effect(effect)
+                time.sleep(0.2)
+                check = client.get_device_detail()
+                if check.get("switchState") == SWITCH_MANUAL:
+                    log.info("Alarm effect confirmed on attempt %d", attempt + 1)
+                    break
+                log.warning("Device unresponsive (switchState=%s), retry %d/5",
+                            check.get("switchState"), attempt + 1)
 
     def _run_cycle_effect(self, effect_name: str):
         """Loop through cycle-effect frames while this effect is active."""
