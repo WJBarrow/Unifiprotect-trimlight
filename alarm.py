@@ -17,6 +17,7 @@ Requires only Python stdlib — no pip dependencies.
 import base64
 import hashlib
 import hmac
+import html as html_lib
 import json
 import logging
 import os
@@ -28,6 +29,8 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from urllib.request import Request, urlopen
+
+MAX_BODY = 64 * 1024  # L1: cap webhook/test request body size
 from urllib.error import URLError, HTTPError
 
 log = logging.getLogger("alarm")
@@ -116,6 +119,9 @@ class Config:
             sys.exit("ERROR: Required environment variables not set: " + ", ".join(missing))
         if self.alarm_timeout < 1:
             sys.exit("ERROR: ALARM_TIMEOUT must be >= 1")
+        # L2: keep outbound API calls pinned to the Trimlight host (SSRF guard).
+        if not self.api_url.startswith("https://trimlight.ledhue.com/"):
+            sys.exit("ERROR: TRIMLIGHT_API_URL must be on https://trimlight.ledhue.com/")
 
 
 # ---------------------------------------------------------------------------
@@ -803,7 +809,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
+        length = min(int(self.headers.get("Content-Length", 0)), MAX_BODY)
         return json.loads(self.rfile.read(length)) if length else {}
 
     def _effect_from_query(self) -> str:
@@ -897,8 +903,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         logs = self.alarm_sm.activity_log
         if logs:
             log_items = "\n      ".join(
-                f'<li><time class="log-ts" data-utc="{ts}">{ts}</time>'
-                f'<span class="{"log-error" if lv == "error" else "log-warning" if lv == "warning" else "log-msg"}">{msg}</span></li>'
+                f'<li><time class="log-ts" data-utc="{html_lib.escape(str(ts))}">{html_lib.escape(str(ts))}</time>'
+                f'<span class="{"log-error" if lv == "error" else "log-warning" if lv == "warning" else "log-msg"}">{html_lib.escape(str(msg))}</span></li>'
                 for ts, lv, msg in logs
             )
         else:
@@ -930,7 +936,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def _handle_webhook(self):
         effect_name = self._effect_from_query()
-        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        length = min(int(self.headers.get("Content-Length", 0)), MAX_BODY)
+        raw = self.rfile.read(length)
         log.debug("Webhook raw (%d bytes) effect=%s: %s", len(raw), effect_name, raw[:400])
 
         try:

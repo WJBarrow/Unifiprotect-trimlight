@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .env
+
+# Security report — local-only, never commit
+SECURITY_REPORT.md
