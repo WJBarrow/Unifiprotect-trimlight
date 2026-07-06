@@ -6,3 +6,9 @@ services:
       - "${WEBHOOK_PORT:-8484}:${WEBHOOK_PORT:-8484}"
     env_file:
       - .env
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${WEBHOOK_PORT:-8484}/', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
